@@ -170,7 +170,7 @@ def _validate_router_replay_setup(engine_config, tf_config) -> None:
             "With a single expert slot duplicate replayed routes cannot be represented."
         )
     if dispatcher != "alltoall":
-        logger.warning_once(
+        logger.warning(
             "router_replay is only verified with moe_token_dispatcher_type='alltoall', got %r. "
             "Other dispatchers have not been validated for duplicate replayed routes.",
             dispatcher,

@@ -504,6 +504,47 @@ def test_target_replay_mask_is_normalized_to_bool():
     assert torch.equal(replayed_indices[1], torch.topk(scores[1], k=2, dim=0).indices)
 
 
+# ===========================================================
+# int16 replay cache (lazy cast)
+# ===========================================================
+
+
+def test_replay_index_dtype_uses_int16_when_experts_fit():
+    assert rr_utils._replay_index_dtype(SimpleNamespace(num_moe_experts=128)) == torch.int16
+    assert rr_utils._replay_index_dtype(SimpleNamespace(num_moe_experts=40000)) == torch.int64
+    assert rr_utils._replay_index_dtype(SimpleNamespace()) == torch.int64
+
+
+def test_recording_stores_int16_indices():
+    router = RouterReplay()
+    router.set_router_replay_action(RouterReplayAction.RECORD)
+    scores = torch.randn(3, 8)
+
+    def native_topk(_scores, topk, **_kwargs):
+        return torch.topk(_scores, k=topk, dim=1)
+
+    _, native_indices = router.get_replay_topk(scores, 2, default_compute_topk=native_topk)
+
+    assert native_indices.dtype == torch.int64
+    assert router.recorded_topk_idx.dtype == torch.int16
+
+
+def test_replay_forward_lazily_casts_int16_targets_to_int64():
+    router = RouterReplay()
+    targets = torch.tensor([[1, 3], [2, 0]], dtype=torch.int16)
+    router.set_target_indices(targets)
+    router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    scores = torch.randn(2, 8)
+
+    def native_topk(_scores, topk, **_kwargs):
+        return torch.topk(_scores, k=topk, dim=1)
+
+    _, replayed_indices = router.get_replay_topk(scores, 2, default_compute_topk=native_topk)
+
+    assert replayed_indices.dtype == torch.int64
+    assert torch.equal(replayed_indices, targets.to(torch.int64))
+
+
 def test_set_model_router_replay_action_uses_cached_routers(monkeypatch):
     """Setting actions with a cached router list must not walk the model."""
     r1, r2 = _FakeRouter(), _FakeRouter()
