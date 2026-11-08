@@ -660,13 +660,6 @@ def _replay_num_out_tokens_per_layer(layers_topk_idx_reshape, replay_mask) -> li
     return os.getenv("VERL_ROUTER_REPLAY_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _is_router_replay_rank_zero() -> bool:
-    """True on the only/global rank zero process, including non-distributed runs."""
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return True
-    return torch.distributed.get_rank() == 0
-
-
 def summarize_replay_mask(replay_mask: torch.Tensor | None) -> dict[str, int]:
     """Return replay/native row counts for a boolean replay mask.
 
@@ -870,10 +863,12 @@ def set_router_replay_data(
         route_len = len(layers_topk_idx_reshape)
         num_out_tokens = _replay_num_out_tokens_per_layer(layers_topk_idx_reshape, replay_mask_rmpad_split)
 
-        if is_router_replay_debug_enabled() and _is_router_replay_rank_zero():
+        if is_router_replay_debug_enabled():
             coverage = summarize_replay_mask(replay_mask_rmpad_split)
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             logger.warning(
-                "router replay REPLAY: layers=%d, vp_rank=%s, coverage=%s",
+                "router replay REPLAY: rank=%d, layers=%d, vp_rank=%s, coverage=%s",
+                rank,
                 layers_topk_idx_reshape.shape[0],
                 vp_rank,
                 coverage or "all rows replayed",
