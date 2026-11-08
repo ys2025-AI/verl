@@ -137,7 +137,7 @@ def _check_dcp_unsupported_features(engine_config, model_config, tf_config=None,
             raise NotImplementedError("Dynamic CP does not support distillation")
 
 
-def _validate_router_replay_setup(engine_config, tf_config) -> None:
+def _validate_router_replay_setup(engine_config, tf_config, model_config=None) -> None:
     """Fail fast when a router-replay configuration hits an unverified Megatron path.
 
     Router replay silently degrades (or corrupts routes) when the configured MoE
@@ -146,6 +146,20 @@ def _validate_router_replay_setup(engine_config, tf_config) -> None:
     """
     if engine_config.router_replay.mode == "disabled":
         return
+
+    model_type = getattr(getattr(model_config, "hf_config", None), "model_type", None)
+    mtp_enabled = bool(getattr(getattr(model_config, "mtp", None), "enable", False))
+    if model_type == "deepseek_v4":
+        if not getattr(engine_config, "use_fused_kernels", False):
+            raise ValueError(
+                "router_replay on deepseek_v4 requires use_fused_kernels=True: the hash router only "
+                "records input_ids in the fused forward. Enable fused kernels or turn off router_replay."
+            )
+        if mtp_enabled:
+            raise ValueError(
+                "router_replay on deepseek_v4 is incompatible with MTP: enabling MTP disables the "
+                "fused forward that records hash-routing input_ids."
+            )
 
     permute_fusion = bool(getattr(tf_config, "moe_permute_fusion", False))
     router_fusion = bool(getattr(tf_config, "moe_router_fusion", False))
@@ -183,6 +197,15 @@ def _validate_router_replay_setup(engine_config, tf_config) -> None:
         router_fusion,
         getattr(tf_config, "num_layers", "?"),
     )
+
+
+def _validate_r2_batch_has_no_routed_experts(mode: str, routed_experts) -> None:
+    """R2 must not receive rollout-captured routes; that is R3's contract."""
+    if mode == "R2" and routed_experts is not None:
+        raise RuntimeError(
+            "router_replay.mode='R2' must not receive routed_experts from rollout. "
+            "Disable rollout routing replay for R2, or switch to R3."
+        )
 
 
 def _attach_dcp_recorded_routes(losses_reduced: list[dict], layers_topk_idx: torch.Tensor) -> None:
@@ -277,6 +300,11 @@ class MegatronEngine(BaseEngine):
         self.enable_routing_replay = self.engine_config.router_replay.mode != "disabled"
         logger.info(f"enable_routing_replay in MegatronEngine: {self.enable_routing_replay}")
         if self.enable_routing_replay:
+            if RouterReplay.router_instances:
+                logger.warning(
+                    "Another router replay model is already registered in this process; replay actions "
+                    "are model-scoped, but avoid sharing one process across unrelated replay models."
+                )
             apply_router_replay_patch()
             self.mini_layer_topk_idx_list = []
         # Apply checkpoint patch for MoE models
@@ -518,7 +546,7 @@ class MegatronEngine(BaseEngine):
             peft_config=self.model_config.get("lora", None),
         )
         self.tf_config = updated_tf_config
-        _validate_router_replay_setup(self.engine_config, updated_tf_config)
+        _validate_router_replay_setup(self.engine_config, updated_tf_config, self.model_config)
         print(f"module: {len(module)}")
 
         if self.engine_config.use_dist_checkpointing:
@@ -1340,6 +1368,10 @@ class MegatronEngineWithLMHead(MegatronEngine):
         pad_mode = tu.get_non_tensor_data(batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         temperature = batch["temperature"]
         model_inputs = self.prepare_model_inputs(batch)
+        if self.enable_routing_replay:
+            _validate_r2_batch_has_no_routed_experts(
+                self.engine_config.router_replay.mode, model_inputs.get("routed_experts", None)
+            )
         input_ids = model_inputs["input_ids"]
         attention_mask = model_inputs["attention_mask"]
         multi_modal_inputs = model_inputs["multi_modal_inputs"]

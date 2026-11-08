@@ -84,3 +84,41 @@ def test_patch_rejects_degraded_import(monkeypatch):
 
     with pytest.raises(RuntimeError, match="MoE helpers are unavailable"):
         replay_patch.apply_router_replay_patch()
+
+
+def _model_config(model_type="qwen3_moe", mtp=False):
+    return SimpleNamespace(
+        hf_config=SimpleNamespace(model_type=model_type),
+        mtp=SimpleNamespace(enable=mtp),
+    )
+
+
+def test_rejects_dsv4_without_fused_kernels():
+    engine_config, tf_config = _configs()
+    engine_config.use_fused_kernels = False
+
+    with pytest.raises(ValueError, match="deepseek_v4 requires use_fused_kernels"):
+        transformer_impl._validate_router_replay_setup(engine_config, tf_config, _model_config("deepseek_v4"))
+
+
+def test_rejects_dsv4_with_mtp():
+    engine_config, tf_config = _configs()
+    engine_config.use_fused_kernels = True
+
+    with pytest.raises(ValueError, match="incompatible with MTP"):
+        transformer_impl._validate_router_replay_setup(engine_config, tf_config, _model_config("deepseek_v4", mtp=True))
+
+
+def test_allows_dsv4_with_fused_and_no_mtp():
+    engine_config, tf_config = _configs()
+    engine_config.use_fused_kernels = True
+
+    transformer_impl._validate_router_replay_setup(engine_config, tf_config, _model_config("deepseek_v4", mtp=False))
+
+
+def test_r2_rejects_rollout_routed_experts():
+    with pytest.raises(RuntimeError, match="must not receive routed_experts"):
+        transformer_impl._validate_r2_batch_has_no_routed_experts("R2", object())
+
+    transformer_impl._validate_r2_batch_has_no_routed_experts("R3", object())
+    transformer_impl._validate_r2_batch_has_no_routed_experts("R2", None)
