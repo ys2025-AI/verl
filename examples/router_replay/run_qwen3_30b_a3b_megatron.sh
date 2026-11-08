@@ -5,6 +5,21 @@
 set -xeuo pipefail
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
+DEVICE=${DEVICE:-$(python3 -c 'import torch, torch_npu; print("npu" if torch.npu.is_available() else "gpu")' 2>/dev/null || echo gpu)}
+
+if [ "${DEVICE}" = npu ]; then
+    export VERL_USE_EXTERNAL_MODULES=${VERL_USE_EXTERNAL_MODULES:-megatron_adaptor}
+    export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1500}
+    export HCCL_HOST_SOCKET_PORT_RANGE=${HCCL_HOST_SOCKET_PORT_RANGE:-60000-60050}
+    export HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE:-61000-61050}
+    export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=${RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES:-1}
+    export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+    export DISABLE_L2_CACHE=${DISABLE_L2_CACHE:-1}
+    export TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE:-1}
+    export HCCL_OP_EXPANSION_MODE=${HCCL_OP_EXPANSION_MODE:-AIV}
+    export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-max_split_size_mb:1024}
+fi
+
 ########################### user-adjustable ###########################
 INFER_BACKEND=${INFER_BACKEND:-vllm}
 
@@ -43,14 +58,27 @@ experiment_name=${EXPERIMENT_NAME:-}
 ########################### end user-adjustable ###########################
 
 ########################### derived defaults ###########################
-NNODES=${NNODES:-6}
-train_batch_size=${train_batch_size:-3}
-ppo_mini_batch_size=${ppo_mini_batch_size:-3}
+if [ "${DEVICE}" = npu ]; then
+    NNODES=${NNODES:-1}
+    train_batch_size=${train_batch_size:-8}
+    ppo_mini_batch_size=${ppo_mini_batch_size:-8}
+    actor_pp=${actor_pp:-1}
+    actor_tp=${actor_tp:-1}
+    actor_ep=${actor_ep:-8}
+    rollout_tp=${rollout_tp:-4}
+    use_fused_kernels=False
+else
+    NNODES=${NNODES:-6}
+    train_batch_size=${train_batch_size:-3}
+    ppo_mini_batch_size=${ppo_mini_batch_size:-3}
+    actor_pp=${actor_pp:-6}
+    actor_tp=${actor_tp:-1}
+    actor_ep=${actor_ep:-8}
+    rollout_tp=${rollout_tp:-4}
+    use_fused_kernels=True
+fi
 max_prompt_length=${max_prompt_length:-512}
 max_response_length=${max_response_length:-512}
-actor_pp=${actor_pp:-6}
-actor_tp=${actor_tp:-1}
-rollout_tp=${rollout_tp:-4}
 actor_use_dynamic_bsz=False
 rollout_log_prob_use_dynamic_bsz=False
 ref_log_prob_use_dynamic_bsz=False
@@ -85,12 +113,12 @@ DATA=(
 MODEL=(
     actor_rollout_ref.model.path="$MODEL_PATH"
     actor_rollout_ref.model.use_remove_padding=True
-    actor_rollout_ref.model.use_fused_kernels=True
+    actor_rollout_ref.model.use_fused_kernels=${use_fused_kernels}
 )
 
 ACTOR=(
+    model_engine=megatron
     actor_rollout_ref.actor.strategy=megatron
-    actor_rollout_ref.actor.model_engine=megatron
     actor_rollout_ref.actor.optim.lr=${actor_lr}
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size}
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${micro_bs}
@@ -108,17 +136,29 @@ ACTOR=(
     actor_rollout_ref.actor.megatron.optimizer_offload=${offload}
     actor_rollout_ref.actor.megatron.use_mbridge=True
     actor_rollout_ref.actor.megatron.router_replay.mode=${ROUTING_REPLAY_MODE}
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_enable_deepep=True
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type=flex
-    +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=True
-    +actor_rollout_ref.actor.megatron.override_transformer_config.bias_activation_fusion=True
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_router_dtype=fp32
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1
-    +actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=${moe_permute_fusion}
 )
+
+if [ "${DEVICE}" = npu ]; then
+    ACTOR+=(
+        actor_rollout_ref.actor.megatron.use_dist_checkpointing=False
+        +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True
+        +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type=alltoall
+        +actor_rollout_ref.actor.megatron.override_ddp_config.grad_reduce_in_fp32=False
+    )
+else
+    ACTOR+=(
+        +actor_rollout_ref.actor.megatron.override_transformer_config.moe_enable_deepep=True
+        +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type=flex
+        +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=True
+        +actor_rollout_ref.actor.megatron.override_transformer_config.bias_activation_fusion=True
+        +actor_rollout_ref.actor.megatron.override_transformer_config.moe_router_dtype=fp32
+        +actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=True
+    )
+fi
 
 ROLLOUT=(
     actor_rollout_ref.rollout.name=${INFER_BACKEND}
@@ -145,6 +185,12 @@ REF=(
     actor_rollout_ref.ref.megatron.param_offload=${offload}
 )
 
+if [ "${DEVICE}" = npu ]; then
+    REF+=(
+        actor_rollout_ref.ref.megatron.use_dist_checkpointing=False
+    )
+fi
+
 TRAINER=(
     trainer.critic_warmup=0
     trainer.balance_batch=${trainer_balance_batch}
@@ -158,6 +204,10 @@ TRAINER=(
     trainer.total_training_steps=${total_training_steps}
     trainer.val_before_train=False
 )
+
+if [ "${DEVICE}" = npu ]; then
+    TRAINER+=(trainer.device=npu)
+fi
 
 # Conservative rollout extras shared by all inference backends.
 EXTRA=(
