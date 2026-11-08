@@ -20,13 +20,31 @@ from functools import wraps
 
 import torch
 
+try:
+    from megatron.core.transformer.moe.moe_utils import (
+        apply_router_token_dropping,
+        compute_routing_scores_for_aux_loss,
+        group_limited_topk,
+    )
+    from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+
+    _REPLAY_IMPORT_ERROR = None
+except ImportError as exc:
+    warnings.warn(
+        f"Router replay is unavailable because Megatron-Core's MoE helpers failed to import: {exc!r}",
+        stacklevel=2,
+    )
+    MoEAlltoAllTokenDispatcher = None
+    _REPLAY_IMPORT_ERROR = exc
+from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.transformer_config import TransformerConfig
+
 _REPLAY_REQUIRED_SYMBOLS = (
     "apply_router_token_dropping",
     "compute_routing_scores_for_aux_loss",
     "group_limited_topk",
     "MoEAlltoAllTokenDispatcher",
 )
-_REPLAY_IMPORT_ERROR = None
 _INT16_MAX = torch.iinfo(torch.int16).max
 _INT8_MAX = torch.iinfo(torch.uint8).max
 
@@ -72,22 +90,6 @@ def _replay_storage_dtype(num_experts: int | None) -> torch.dtype | None:
         return torch.int16
     return None
 
-try:
-    from megatron.core.transformer.moe.moe_utils import (
-        apply_router_token_dropping,
-        compute_routing_scores_for_aux_loss,
-        group_limited_topk,
-    )
-    from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
-except ImportError as exc:
-    warnings.warn(
-        f"Router replay is unavailable because Megatron-Core's MoE helpers failed to import: {exc!r}",
-        stacklevel=2,
-    )
-    MoEAlltoAllTokenDispatcher = None
-    _REPLAY_IMPORT_ERROR = exc
-from megatron.core.transformer.moe.router import TopKRouter
-from megatron.core.transformer.transformer_config import TransformerConfig
 
 # https://github.com/THUDM/slime/blob/main/slime/utils/routing_replay.py
 
