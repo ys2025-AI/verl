@@ -48,6 +48,8 @@ from verl.utils.megatron.router_replay_utils import (
     RouterReplayHelper,
     align_r3_router_replay_data,
     build_r3_replay_mask,
+    clear_model_router_replay_action,
+    clear_model_router_replay_indices,
     prepare_r3_router_replay_data,
     iter_model_routers,
     merge_nested_router_maps,
@@ -1009,26 +1011,36 @@ class MegatronEngine(BaseEngine):
         )
 
         if enable_routing_replay:
+            # Drop any routes left over by a previous failed step before starting a new one.
+            self.mini_layer_topk_idx_list = []
             # Set to REPLAY mode: for R3 mode or actor update phase in R2 mode
-            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+            set_model_router_replay_action(self.module, RouterReplayAction.REPLAY_FORWARD)
             if record_r2_routes:
                 # In R2 mode, forward_only calls (e.g., compute_log_probs) need to record routing information
-                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+                set_model_router_replay_action(self.module, RouterReplayAction.RECORD)
 
         # batch should be a list of batches inside micro-batches
         batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.module))
 
         # TODO: we may use the new schedule instead
         # for flash-attn: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step,
-            data_iterator=batch_generator,
-            model=self.module,
-            num_microbatches=n_micro_batch,
-            seq_length=1,  # the communication shape is obtained via p2p comm
-            micro_batch_size=1,  # the communication shape is obtained via p2p comm
-            forward_only=forward_only,
-        )
+        try:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=batch_generator,
+                model=self.module,
+                num_microbatches=n_micro_batch,
+                seq_length=1,  # the communication shape is obtained via p2p comm
+                micro_batch_size=1,  # the communication shape is obtained via p2p comm
+                forward_only=forward_only,
+            )
+        except Exception:
+            # Keep router replay state from leaking into the next step after an error.
+            if enable_routing_replay:
+                self.mini_layer_topk_idx_list = []
+                clear_model_router_replay_indices(self.module)
+                clear_model_router_replay_action(self.module)
+            raise
 
         if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
             # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,
@@ -1076,8 +1088,8 @@ class MegatronEngine(BaseEngine):
             if record_r2_routes and dcp_group is None:
                 output["model_output"]["routed_experts"] = layers_topk_idx
         if enable_routing_replay:
-            RouterReplay.clear_global_indices()
-            RouterReplay.clear_global_router_replay_action()
+            clear_model_router_replay_indices(self.module)
+            clear_model_router_replay_action(self.module)
         return output
 
     def _mbridge_export_tasks(self):

@@ -920,6 +920,18 @@ def set_model_router_replay_action(model, router_replay_action, routers=None):
         router.set_router_replay_action(router_replay_action)
 
 
+def clear_model_router_replay_action(model):
+    """Clear the router replay action on the forwarded model's own routers only."""
+    for _, router in iter_model_routers(model):
+        router.clear_router_replay_action()
+
+
+def clear_model_router_replay_indices(model):
+    """Clear recorded/target indices on the forwarded model's own routers only."""
+    for _, router in iter_model_routers(model):
+        router.clear_indices()
+
+
 def reorder_and_merge_vpp_layers(
     micro_batch_tensor_list,
     num_microbatches: int,
