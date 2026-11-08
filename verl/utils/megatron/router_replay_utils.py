@@ -18,6 +18,8 @@ Utilities for handling router replay functionality in Megatron models.
 """
 
 import inspect
+import logging
+import os
 import warnings
 
 import torch
@@ -45,6 +47,8 @@ from verl.models.mcore.util import (
 )
 from verl.utils.device import get_device_name
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
+
+logger = logging.getLogger(__name__)
 
 device_name = get_device_name()
 
@@ -652,6 +656,33 @@ def _replay_num_out_tokens_per_layer(layers_topk_idx_reshape, replay_mask) -> li
     return [int(count) for count in counts.tolist()]
 
 
+    """Whether ``VERL_ROUTER_REPLAY_DEBUG`` enables replay diagnostics."""
+    return os.getenv("VERL_ROUTER_REPLAY_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_router_replay_rank_zero() -> bool:
+    """True on the only/global rank zero process, including non-distributed runs."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return True
+    return torch.distributed.get_rank() == 0
+
+
+def summarize_replay_mask(replay_mask: torch.Tensor | None) -> dict[str, int]:
+    """Return replay/native row counts for a boolean replay mask.
+
+    ``None`` means every row is replayed; callers get an empty summary.
+    """
+    if replay_mask is None:
+        return {}
+    total_rows = int(replay_mask.numel())
+    replay_rows = int(replay_mask.sum().item())
+    return {
+        "total_rows": total_rows,
+        "replay_rows": replay_rows,
+        "native_rows": total_rows - replay_rows,
+    }
+
+
 def set_router_replay_data(
     layers_topk_idx,
     attention_mask,
@@ -838,6 +869,15 @@ def set_router_replay_data(
         # dim-0 only contains MoE layers, index by MoE-layer ordinal.
         route_len = len(layers_topk_idx_reshape)
         num_out_tokens = _replay_num_out_tokens_per_layer(layers_topk_idx_reshape, replay_mask_rmpad_split)
+
+        if is_router_replay_debug_enabled() and _is_router_replay_rank_zero():
+            coverage = summarize_replay_mask(replay_mask_rmpad_split)
+            logger.warning(
+                "router replay REPLAY: layers=%d, vp_rank=%s, coverage=%s",
+                layers_topk_idx_reshape.shape[0],
+                vp_rank,
+                coverage or "all rows replayed",
+            )
 
         if model is not None:
             model_routers = list(routers) if routers is not None else list(iter_model_routers(model))
