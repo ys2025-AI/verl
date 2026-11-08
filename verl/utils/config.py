@@ -71,17 +71,19 @@ def update_dict_with_config(dictionary: dict, config: DictConfig):
             dictionary[key] = getattr(config, key)
 
 
-def _validate_router_replay_config(actor_config: Any, rollout_correction: Any) -> None:
+def _validate_router_replay_config(actor_config: Any, rollout_correction: Any, rollout_config: Any = None) -> None:
     engine_config = getattr(actor_config, "engine", None)
     router_replay = getattr(engine_config, "router_replay", None)
-    if (
-        getattr(router_replay, "mode", "disabled") == "R2"
-        and rollout_correction
-        and rollout_correction.get("bypass_mode", False)
-    ):
+    mode = getattr(router_replay, "mode", "disabled")
+    if mode == "R2" and rollout_correction and rollout_correction.get("bypass_mode", False):
         raise ValueError(
             "router_replay.mode='R2' requires algorithm.rollout_correction.bypass_mode=False: "
             "R2 records routes while recomputing actor old_log_probs, but bypass mode skips that forward."
+        )
+    if mode == "R2" and rollout_config is not None and rollout_config.get("enable_rollout_routing_replay", False):
+        raise ValueError(
+            "router_replay.mode='R2' must not enable rollout.enable_rollout_routing_replay: "
+            "R2 records routes on the training side; rollout capture is only used by R3."
         )
 
 
@@ -197,7 +199,11 @@ def validate_config(
     # Actor validation done in ActorConfig.__post_init__ and validate()
     actor_config = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
     actor_config.validate(n_gpus, config.data.train_batch_size, config.actor_rollout_ref.model)
-    _validate_router_replay_config(actor_config, config.algorithm.get("rollout_correction", None))
+    _validate_router_replay_config(
+        actor_config,
+        config.algorithm.get("rollout_correction", None),
+        rollout_config=config.actor_rollout_ref.rollout,
+    )
     _validate_score_centering_config(config)
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:

@@ -35,3 +35,13 @@ def test_non_r2_modes_allow_bypass(mode):
 
 def test_r2_allows_decoupled_old_log_prob():
     _validate_router_replay_config(_actor_config("R2"), {"bypass_mode": False})
+
+
+@pytest.mark.parametrize("mode", ["disabled", "R3"])
+def test_non_r2_modes_allow_rollout_capture(mode):
+    _validate_router_replay_config(_actor_config(mode), None, {"enable_rollout_routing_replay": True})
+
+
+def test_r2_rejects_rollout_capture():
+    with pytest.raises(ValueError, match="must not enable rollout.enable_rollout_routing_replay"):
+        _validate_router_replay_config(_actor_config("R2"), None, {"enable_rollout_routing_replay": True})
