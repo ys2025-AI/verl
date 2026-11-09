@@ -624,6 +624,200 @@ def test_set_router_replay_data_slices_to_local_pp_layers(monkeypatch):
     assert torch.equal(routers[1].target_topk_idx, routed_experts[0, :, 3, :])
 
 
+def test_set_router_replay_data_applies_bshd_replay_mask(monkeypatch):
+    """BSHD replay masks are packed and installed, not silently dropped."""
+    router = _FakeRouter()
+    tf_config = _config(num_layers=1)
+    routed_experts = torch.ones(1, 3, 2, 1, dtype=torch.int64)
+    replay_mask = torch.tensor([[True, True, False]])
+
+    monkeypatch.setattr(rr_utils, "device_name", "cpu")
+    monkeypatch.setattr(rr_utils, "preprocess_packed_seqs", lambda tensor, _mask, **_kwargs: (tensor, object()))
+    monkeypatch.setattr(rr_utils, "scatter_to_sequence_parallel_region", lambda tensor: tensor)
+    monkeypatch.setattr(rr_utils, "iter_model_routers", lambda model: iter([(1, router)]))
+
+    rr_utils.set_router_replay_data(
+        routed_experts,
+        torch.ones(1, 3, dtype=torch.bool),
+        tf_config,
+        replay_mask=replay_mask,
+        model=object(),
+    )
+
+    assert router.target_replay_mask is not None
+    assert torch.equal(router.target_replay_mask, replay_mask.squeeze(0))
+
+
+    monkeypatch.setattr(rr_utils, "device_name", "cpu")
+    monkeypatch.setattr(rr_utils, "preprocess_packed_seqs", lambda tensor, _mask, **_kwargs: (tensor, object()))
+    monkeypatch.setattr(rr_utils, "scatter_to_sequence_parallel_region", lambda tensor: tensor)
+def test_target_replay_mask_is_normalized_to_bool():
+    router = RouterReplay()
+    indices = torch.tensor([[1, 2], [3, 4]], dtype=torch.int64)
+    mask = torch.tensor([1, 0], dtype=torch.int64)
+
+    router.set_target_indices(indices, replay_mask=mask)
+
+    assert router.target_replay_mask.dtype == torch.bool
+    assert router.replay_backward_mask_list[0].dtype == torch.bool
+
+    router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    scores = torch.randn(2, 8)
+
+    def native_topk(_scores, topk, **_kwargs):
+        return torch.topk(_scores, k=topk, dim=1)
+
+    _, replayed_indices = router.get_replay_topk(scores, 2, default_compute_topk=native_topk)
+
+    # First row replays the recorded route; second row keeps the native route.
+    assert torch.equal(replayed_indices[0], indices[0])
+    assert torch.equal(replayed_indices[1], torch.topk(scores[1], k=2, dim=0).indices)
+
+
+# ====================================================
+
+
+# int16 replay cache (lazy cast)
+# ===========================================================
+
+
+def test_replay_index_dtype_uses_int16_when_experts_fit():
+    assert rr_utils._replay_index_dtype(SimpleNamespace(num_moe_experts=128)) == torch.int16
+    assert rr_utils._replay_index_dtype(SimpleNamespace(num_moe_experts=40000)) == torch.int64
+    assert rr_utils._replay_index_dtype(SimpleNamespace()) == torch.int64
+
+
+def test_recording_stores_int16_indices():
+    router = RouterReplay()
+    router.set_router_replay_action(RouterReplayAction.RECORD)
+    scores = torch.randn(3, 8)
+
+    def native_topk(_scores, topk, **_kwargs):
+        return torch.topk(_scores, k=topk, dim=1)
+
+    _, native_indices = router.get_replay_topk(scores, 2, default_compute_topk=native_topk)
+
+    assert native_indices.dtype == torch.int64
+    assert router.recorded_topk_idx.dtype == torch.int16
+
+
+def test_replay_forward_lazily_casts_int16_targets_to_int64():
+    router = RouterReplay()
+    targets = torch.tensor([[1, 3], [2, 0]], dtype=torch.int16)
+    router.set_target_indices(targets)
+    router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    scores = torch.randn(2, 8)
+
+    def native_topk(_scores, topk, **_kwargs):
+        return torch.topk(_scores, k=topk, dim=1)
+
+    _, replayed_indices = router.get_replay_topk(scores, 2, default_compute_topk=native_topk)
+
+    assert replayed_indices.dtype == torch.int64
+    assert torch.equal(replayed_indices, targets.to(torch.int64))
+
+
+def test_set_model_router_replay_action_uses_cached_routers(monkeypatch):
+    """Setting actions with a cached router list must not walk the model."""
+    r1, r2 = _FakeRouter(), _FakeRouter()
+
+    def fail(_model):
+        raise AssertionError("iter_model_routers should not be called when routers are supplied")
+
+    monkeypatch.setattr(rr_utils, "iter_model_routers", fail)
+    rr_utils.set_model_router_replay_action(object(), RouterReplayAction.REPLAY_FORWARD, routers=[(1, r1), (2, r2)])
+
+    assert r1.router_replay_action == RouterReplayAction.REPLAY_FORWARD
+    assert r2.router_replay_action == RouterReplayAction.REPLAY_FORWARD
+
+
+def test_action_query_uses_cached_routers(monkeypatch):
+    """Action queries with a cached router list must not walk the model."""
+    router = _FakeRouter(router_replay_action=RouterReplayAction.REPLAY_FORWARD)
+
+    def fail(_model):
+        raise AssertionError("iter_model_routers should not be called when routers are supplied")
+
+    monkeypatch.setattr(rr_utils, "iter_model_routers", fail)
+    assert rr_utils.RouterReplayHelper.is_replay_forward_action(_config(), model=object(), routers=[(1, router)])
+
+
+def test_set_router_replay_data_uses_cached_routers(monkeypatch):
+    """Installing replay targets with a cached router list must not walk the model."""
+    router = _FakeRouter()
+    tf_config = _config(num_layers=1)
+    routed_experts = torch.ones(1, 3, 2, 1, dtype=torch.int64)
+
+    monkeypatch.setattr(rr_utils, "device_name", "cpu")
+    monkeypatch.setattr(rr_utils, "preprocess_packed_seqs", lambda tensor, _mask, **_kwargs: (tensor, object()))
+    monkeypatch.setattr(rr_utils, "scatter_to_sequence_parallel_region", lambda tensor: tensor)
+    monkeypatch.setattr(
+        rr_utils,
+        "iter_model_routers",
+        lambda _model: (_ for _ in ()).throw(AssertionError("unexpected walk")),
+    )
+
+    rr_utils.set_router_replay_data(
+        routed_experts,
+        torch.ones(1, 3, dtype=torch.bool),
+        tf_config,
+        model=object(),
+        routers=[(1, router)],
+    )
+
+    assert router.target_topk_idx is not None
+
+
+def test_set_router_replay_data_slices_to_local_pp_layers(monkeypatch):
+    """P1-4: only this PP rank's layers are packed/scattered, mapped by global id."""
+    routers = [_FakeRouter(), _FakeRouter()]
+    RouterReplay.router_instances = routers
+    tf_config = _config(num_layers=4)
+    routed_experts = torch.arange(1 * 3 * 4 * 2, dtype=torch.int64).reshape(1, 3, 4, 2)
+
+    monkeypatch.setattr(rr_utils, "device_name", "cpu")
+    monkeypatch.setattr(rr_utils, "get_current_rank_layer_info", lambda *a, **k: {"start": 2, "end": 4, "count": 2})
+    monkeypatch.setattr(
+        rr_utils, "preprocess_packed_seqs", lambda tensor, attention_mask, **_kwargs: (tensor, object())
+    )
+    monkeypatch.setattr(rr_utils, "scatter_to_sequence_parallel_region", lambda tensor: tensor)
+    monkeypatch.setattr(rr_utils, "iter_model_routers", lambda model: iter([(3, routers[0]), (4, routers[1])]))
+
+    rr_utils.set_router_replay_data(
+        routed_experts,
+        torch.ones(1, 3, dtype=torch.bool),
+        tf_config,
+        model=object(),
+    )
+
+    assert torch.equal(routers[0].target_topk_idx, routed_experts[0, :, 2, :])
+    assert torch.equal(routers[1].target_topk_idx, routed_experts[0, :, 3, :])
+
+
+def test_set_router_replay_data_applies_bshd_replay_mask(monkeypatch):
+    """BSHD replay masks are packed and installed, not silently dropped."""
+    router = _FakeRouter()
+    tf_config = _config(num_layers=1)
+    routed_experts = torch.ones(1, 3, 2, 1, dtype=torch.int64)
+    replay_mask = torch.tensor([[True, True, False]])
+
+    monkeypatch.setattr(rr_utils, "device_name", "cpu")
+    monkeypatch.setattr(rr_utils, "preprocess_packed_seqs", lambda tensor, _mask, **_kwargs: (tensor, object()))
+    monkeypatch.setattr(rr_utils, "scatter_to_sequence_parallel_region", lambda tensor: tensor)
+    monkeypatch.setattr(rr_utils, "iter_model_routers", lambda model: iter([(1, router)]))
+
+    rr_utils.set_router_replay_data(
+        routed_experts,
+        torch.ones(1, 3, dtype=torch.bool),
+        tf_config,
+        replay_mask=replay_mask,
+        model=object(),
+    )
+
+    assert router.target_replay_mask is not None
+    assert torch.equal(router.target_replay_mask, replay_mask.squeeze(0))
+
+
 def test_router_replay_debug_env(monkeypatch):
     monkeypatch.delenv("VERL_ROUTER_REPLAY_DEBUG", raising=False)
     assert not rr_utils.is_router_replay_debug_enabled()
