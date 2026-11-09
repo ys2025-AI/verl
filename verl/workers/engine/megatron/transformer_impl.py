@@ -136,6 +136,54 @@ def _check_dcp_unsupported_features(engine_config, model_config, tf_config=None,
             raise NotImplementedError("Dynamic CP does not support distillation")
 
 
+def _validate_router_replay_setup(engine_config, tf_config) -> None:
+    """Fail fast when a router-replay configuration hits an unverified Megatron path.
+
+    Router replay silently degrades (or corrupts routes) when the configured MoE
+    dispatcher/fusion options are not the ones exercised by the replay patch.
+    These checks turn those implicit preconditions into explicit failures.
+    """
+    if engine_config.router_replay.mode == "disabled":
+        return
+
+    permute_fusion = bool(getattr(tf_config, "moe_permute_fusion", False))
+    router_fusion = bool(getattr(tf_config, "moe_router_fusion", False))
+    dispatcher = getattr(tf_config, "moe_token_dispatcher_type", "alltoall")
+    topk = getattr(tf_config, "moe_router_topk", None)
+
+    if permute_fusion:
+        raise ValueError(
+            "router_replay requires moe_permute_fusion=False, got True. "
+            "Disable moe_permute_fusion or turn off router_replay."
+        )
+    if router_fusion:
+        raise ValueError(
+            "router_replay requires moe_router_fusion=False, got True. "
+            "Disable moe_router_fusion or turn off router_replay."
+        )
+    if topk == 1:
+        raise ValueError(
+            "router_replay requires moe_router_topk > 1, got 1. "
+            "With a single expert slot duplicate replayed routes cannot be represented."
+        )
+    if dispatcher != "alltoall":
+        logger.warning_once(
+            "router_replay is only verified with moe_token_dispatcher_type='alltoall', got %r. "
+            "Other dispatchers have not been validated for duplicate replayed routes.",
+            dispatcher,
+        )
+
+    logger.info(
+        "router replay setup: mode=%s dispatcher=%s topk=%s permute_fusion=%s router_fusion=%s layers=%s",
+        engine_config.router_replay.mode,
+        dispatcher,
+        topk,
+        permute_fusion,
+        router_fusion,
+        getattr(tf_config, "num_layers", "?"),
+    )
+
+
 def _attach_dcp_recorded_routes(losses_reduced: list[dict], layers_topk_idx: torch.Tensor) -> None:
     """Attach recorded routes to DCP micro-batches without dropping or inventing samples."""
     recorded_routes = list(layers_topk_idx.unbind())
@@ -483,6 +531,7 @@ class MegatronEngine(BaseEngine):
             peft_config=self.model_config.get("lora", None),
         )
         self.tf_config = updated_tf_config
+        _validate_router_replay_setup(self.engine_config, updated_tf_config)
         print(f"module: {len(module)}")
 
         if self.engine_config.use_dist_checkpointing:
