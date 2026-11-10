@@ -49,6 +49,7 @@ ACTOR_EP=${ACTOR_EP:-8}
 ACTOR_ETP=${ACTOR_ETP:-1}
 ROLLOUT_TP=${ROLLOUT_TP:-4}
 ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.45}      # 必须 <= (HBM - actor峰值 - 余量)/HBM
+ENFORCE_EAGER=${ENFORCE_EAGER:-False}                   # False=FULL aclgraph 图模式（推荐，见 runbook 13.6）
 
 ACTOR_LR=${ACTOR_LR:-1e-6}
 PROJECT_NAME=${PROJECT_NAME:-verl_grpo_router_replay_qwen36_16l}
@@ -95,6 +96,8 @@ export VLLM_MQ_MAX_CHUNK_BYTES_MB=1
 # v1/TQ + R3 必须
 export TQ_ZERO_COPY_SERIALIZATION=False
 export VLLM_USE_V2_MODEL_RUNNER=1                        # 12.2.1: R3 捕获要求 V2 runner
+export VLLM_USE_AOT_COMPILE=0                            # 13.6: torch 2.10.0+cpu 无 serializable aot_compile，
+                                                         # 关闭后 FULL aclgraph 图模式可正常工作
 ########################### end Ascend NPU 环境 ###########################
 
 PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-$(((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH) * 2))}
@@ -185,7 +188,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}
     actor_rollout_ref.rollout.enable_rollout_routing_replay=${ENABLE_ROLLOUT_ROUTING_REPLAY}
-    actor_rollout_ref.rollout.enforce_eager=True          # 10.5: torch 2.10.0+cpu 的 aot_compile 兼容问题
+    actor_rollout_ref.rollout.enforce_eager=${ENFORCE_EAGER}  # 图模式见 runbook 13.6（需 VLLM_USE_AOT_COMPILE=0）
     actor_rollout_ref.rollout.skip_tokenizer_init=True
     # 12.2.2: RL 场景必须关 FRACTAL_NZ（rl_config 自动置 weight_nz_mode=0）
     +actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.rl_config.enabled=true
