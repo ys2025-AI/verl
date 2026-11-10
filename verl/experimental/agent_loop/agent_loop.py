@@ -129,7 +129,15 @@ class AgentLoopOutput(BaseModel):
 
         routed_experts = output.pop("routed_experts", None)
         if routed_experts is not None:
-            routed_experts = torch.tensor(routed_experts, dtype=torch.int16)
+            # Expert ids fit in uint8 when num_experts <= 256 (halves route-cache and TQ
+            # bytes vs int16; runbook 14.x). The router casts back to int64 for gather.
+            routed_experts = torch.tensor(routed_experts)
+            if routed_experts.numel() > 0 and int(routed_experts.max()) <= 255:
+                routed_experts = routed_experts.to(torch.uint8)
+            elif routed_experts.numel() > 0 and int(routed_experts.max()) <= 32767:
+                routed_experts = routed_experts.to(torch.int16)
+            else:
+                routed_experts = routed_experts.to(torch.int64)
             # Router replay indexes this field by absolute token position, so it must
             # span the whole sequence. The rollout engine records fewer rows than that:
             # it only sees tokens fed through the model, and multi-turn loops stop

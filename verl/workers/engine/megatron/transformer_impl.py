@@ -48,6 +48,7 @@ from verl.utils.megatron.router_replay_utils import (
     RouterReplayHelper,
     align_r3_router_replay_data,
     build_r3_replay_mask,
+    prepare_r3_router_replay_data,
     iter_model_routers,
     merge_nested_router_maps,
     merge_router_topk_indices,
@@ -1384,8 +1385,10 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 )
             replay_mask = None
             if self.engine_config.router_replay.mode == "R3":
-                layers_topk_idx = align_r3_router_replay_data(layers_topk_idx, input_ids)
-                replay_mask = build_r3_replay_mask(input_ids, batch["response_mask"])
+                # Single per-sequence pass builds aligned routes and the replay mask together.
+                layers_topk_idx, replay_mask = prepare_r3_router_replay_data(
+                    layers_topk_idx, input_ids, batch["response_mask"]
+                )
             set_router_replay_data(
                 layers_topk_idx,
                 attention_mask,

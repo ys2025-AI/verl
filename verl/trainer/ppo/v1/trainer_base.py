@@ -111,6 +111,26 @@ def _count_tq_prompt_groups(partition_id: str = "train") -> int:
     return sum(1 for tag in data.get(partition_id, {}).values() if tag.get("is_prompt", False))
 
 
+def _project_batch_fields(batch: KVBatchMeta, exclude: set[str]) -> KVBatchMeta:
+    """Copy a KVBatchMeta with some TransferQueue fields excluded from the fetch.
+
+    When ``fields`` is unset the consumer fetches every stored field; we cannot
+    project in that case and return the original meta unchanged.
+    """
+    if not batch.fields:
+        return batch
+    projected = [field for field in batch.fields if field not in exclude]
+    if len(projected) == len(batch.fields):
+        return batch
+    return KVBatchMeta(
+        keys=batch.keys,
+        tags=batch.tags,
+        partition_id=batch.partition_id,
+        fields=projected,
+        extra_info=batch.extra_info,
+    )
+
+
 class PPOTrainer(ABC):
     """Base class for PPO trainer.
 
@@ -1704,7 +1724,14 @@ class PPOTrainer(ABC):
         return batch
 
     def _compute_ref_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
-        """Compute the reference log prob of the batch."""
+        """Compute the reference log prob of the batch.
+
+        Router-replay semantics (runbook P0-2 decision): the reference policy is a fixed
+        policy and must be evaluated on its own deterministic routing, not on the rollout
+        actor's routes. The ref engine therefore never replays, and its TransferQueue
+        fetch projects ``routed_experts`` away so long-sequence runs do not ship
+        (tens-of-MB to GB) route tensors to a consumer that cannot use them.
+        """
         # 1. compute log probs
         metadata = {
             "calculate_entropy": False,
@@ -1715,9 +1742,20 @@ class PPOTrainer(ABC):
             metadata["no_lora_adapter"] = True
         batch.extra_info.update(metadata)
         if self.ref_in_actor:
+            # The actor engine owns the replay state; ref-in-actor shares it and needs routes.
             output = self.actor_rollout_wg.compute_log_prob(batch)
         else:
-            output = self.ref_policy_wg.compute_ref_log_prob(batch)
+            ref_replay_mode = self.config.actor_rollout_ref.get("ref", {}).get("megatron", {}).get(
+                "router_replay", {}
+            )
+            ref_replay_mode = ref_replay_mode.get("mode", "disabled") if ref_replay_mode else "disabled"
+            if ref_replay_mode != "disabled":
+                raise RuntimeError(
+                    "ref policy router replay must stay disabled: the reference policy represents "
+                    "its own deterministic routing (runbook P0-2). Set "
+                    "`actor_rollout_ref.ref.megatron.router_replay.mode=disabled`."
+                )
+            output = self.ref_policy_wg.compute_ref_log_prob(_project_batch_fields(batch, exclude={"routed_experts"}))
         assert len(output) == len(batch)
 
         # 2. write ref_log_prob and entropy back to TransferQueue

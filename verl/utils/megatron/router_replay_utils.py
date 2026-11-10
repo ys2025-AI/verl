@@ -383,13 +383,79 @@ def merge_router_topk_indices(
         mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
 
 
-def build_r3_replay_mask(input_ids: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+def _r3_route_parts(layers_topk_idx, input_ids, response_mask):
+    """Unpack the R3 inputs once: aligned per-sequence routes, lengths and replay flags."""
+    if not layers_topk_idx.is_nested or not input_ids.is_nested:
+        raise TypeError("R3 router replay requires jagged route targets and input_ids")
+
+    route_parts = list(layers_topk_idx.unbind())
+    input_lens = [int(length) for length in input_ids.offsets().diff().tolist()]
+    if len(route_parts) != len(input_lens):
+        raise RuntimeError(
+            f"R3 router replay has {len(route_parts)} route sequences for {len(input_lens)} input sequences"
+        )
+    response_lens = [int(length) for length in response_mask.sum(dim=-1).tolist()]
+
+    aligned_parts = []
+    replay_parts = []
+    for sample_id, (routes, input_len, response_len) in enumerate(
+        zip(route_parts, input_lens, response_lens, strict=True)
+    ):
+        route_len = routes.shape[0]
+        if route_len == input_len:
+            aligned = routes
+        elif route_len == input_len - 1:
+            placeholder = torch.zeros((1, *routes.shape[1:]), dtype=routes.dtype, device=routes.device)
+            aligned = torch.cat((routes, placeholder), dim=0)
+        else:
+            raise RuntimeError(
+                f"R3 router replay sample {sample_id} has {route_len} route rows for {input_len} input tokens; "
+                "expected equal lengths or exactly one missing final route"
+            )
+        # Replay every causal row that can influence response logprobs, skipping only the
+        # final response row. Rows without a recorded route (all-zero: prefix-cached turns
+        # or trailing placeholders) fall back to the actor's native routing instead of
+        # replaying the zero placeholder (multi-turn rollouts only record recomputed rows).
+        replay = torch.zeros(input_len, dtype=torch.bool, device=aligned.device)
+        if response_len > 0:
+            replay[: input_len - 1] = True
+        replay &= aligned.flatten(1).ne(0).any(dim=-1)
+        aligned_parts.append(aligned)
+        replay_parts.append(replay)
+
+    offsets = input_ids.offsets()
+    return aligned_parts, replay_parts, offsets
+
+
+def prepare_r3_router_replay_data(layers_topk_idx, input_ids, response_mask):
+    """Align R3 routes and build the replay mask in a single per-sequence pass.
+
+    Combining the two per-sample loops avoids unpacking the jagged routes twice for
+    every micro-batch, which is a measurable share of the replay install cost.
+    """
+    aligned_parts, replay_parts, offsets = _r3_route_parts(layers_topk_idx, input_ids, response_mask)
+    aligned = torch.nested.as_nested_tensor(aligned_parts, layout=torch.jagged)
+    mask_values = torch.cat(replay_parts).to(device=offsets.device)
+    mask = torch.nested.nested_tensor_from_jagged(mask_values, offsets=offsets)
+    return aligned, mask
+
+
+def build_r3_replay_mask(
+    input_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    routed_experts: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Build a full-sequence replay mask for rollout-captured routes.
 
     Response logprobs are read from shifted model rows, but those rows attend to
     earlier hidden states whose MoE routing also affects the result. Replay every
     causal row that can influence response logprobs and skip only the final
     response row, whose logits are not used by ``no_padding_2_padding``.
+
+    When ``routed_experts`` is given (already aligned to ``input_ids`` lengths), rows
+    without a recorded route (all-zero, e.g. prefix-cached turns or trailing
+    placeholders) fall back to the actor's native routing instead of replaying the
+    zero placeholder — multi-turn rollouts only record the rows the engine recomputed.
     """
     total_lens = input_ids.offsets().diff()
     response_lens = response_mask.sum(dim=-1).to(device=total_lens.device, dtype=total_lens.dtype)
@@ -399,6 +465,16 @@ def build_r3_replay_mask(input_ids: torch.Tensor, response_mask: torch.Tensor) -
     suffix_lens = total_lens - replay_lens
     counts = torch.stack([replay_lens, suffix_lens], dim=1).flatten()
     mask_values = torch.repeat_interleave(values, counts)
+    if routed_experts is not None and routed_experts.is_nested:
+        valid_parts = []
+        for routes, total_len in zip(routed_experts.unbind(), total_lens.tolist(), strict=True):
+            routes = routes[:total_len]
+            if routes.shape[0] < total_len:
+                pad = routes.new_zeros((total_len - routes.shape[0], *routes.shape[1:]))
+                routes = torch.cat([routes, pad], dim=0)
+            valid_parts.append(routes.flatten(1).ne(0).any(dim=-1))
+        valid_values = torch.cat(valid_parts).to(device=mask_values.device)
+        mask_values = mask_values & valid_values
     return torch.nested.nested_tensor_from_jagged(mask_values, offsets=input_ids.offsets())
 
 
@@ -412,14 +488,12 @@ def align_r3_router_replay_data(layers_topk_idx: torch.Tensor, input_ids: torch.
     """
     if not layers_topk_idx.is_nested or not input_ids.is_nested:
         raise TypeError("R3 router replay requires jagged route targets and input_ids")
-
     route_parts = list(layers_topk_idx.unbind())
     input_lens = [int(length) for length in input_ids.offsets().diff().tolist()]
     if len(route_parts) != len(input_lens):
         raise RuntimeError(
             f"R3 router replay has {len(route_parts)} route sequences for {len(input_lens)} input sequences"
         )
-
     aligned_parts = []
     for sample_id, (routes, input_len) in enumerate(zip(route_parts, input_lens, strict=True)):
         route_len = routes.shape[0]
@@ -433,14 +507,29 @@ def align_r3_router_replay_data(layers_topk_idx: torch.Tensor, input_ids: torch.
                 f"R3 router replay sample {sample_id} has {route_len} route rows for {input_len} input tokens; "
                 "expected equal lengths or exactly one missing final route"
             )
-
     return torch.nested.as_nested_tensor(aligned_parts, layout=torch.jagged)
 
 
+def _sequence_parallel_size() -> int:
+    """TP x CP when the parallel groups are initialized; unit tests run without them."""
+    try:
+        return int(mpu.get_tensor_model_parallel_world_size()) * int(mpu.get_context_parallel_world_size())
+    except (AssertionError, RuntimeError):
+        return 1
+
+
 def _replay_index_dtype(tf_config):
-    """Keep replay targets in int16 when expert ids fit, cutting the cache 4x."""
+    """Smallest dtype that fits expert ids: uint8 (<=256 experts) < int16 < int64.
+
+    Routes are only used as gather/index operands after an int64 cast at the router,
+    so the storage dtype shrinks the replay cache 8x (uint8 vs int64) or 2x (vs int16).
+    """
     num_experts = getattr(tf_config, "num_moe_experts", None)
-    if num_experts is not None and num_experts <= torch.iinfo(torch.int16).max:
+    if num_experts is None:
+        return torch.int64
+    if num_experts <= torch.iinfo(torch.uint8).max + 1:
+        return torch.uint8
+    if num_experts <= torch.iinfo(torch.int16).max:
         return torch.int16
     return torch.int64
 
@@ -591,15 +680,26 @@ def set_router_replay_data(
             )
         layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
 
-        # 1, dynamic_bs_split, layer_num, topk
-        layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
-            layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
-        ).unsqueeze(dim=0)
-        replay_mask_rmpad_split = None
-        if replay_mask_rmpad is not None:
-            replay_mask_rmpad_split = scatter_to_sequence_parallel_region(
-                replay_mask_rmpad.to(device_name).squeeze(dim=0)
+        # With SP==1 (TP=CP=1) the "scatter to sequence-parallel region" is an identity
+        # gather/split of a full-rows tensor; skip it to avoid per-micro-batch comm glue
+        # (P3-B). With SP>1 the split is what makes routes match the local router rows,
+        # so it must stay.
+        sp_size = _sequence_parallel_size()
+        if sp_size == 1:
+            layers_topk_idx_rmpad_split = layers_topk_idx_rmpad.to(device_name)
+            replay_mask_rmpad_split = (
+                None if replay_mask_rmpad is None else replay_mask_rmpad.to(device_name).squeeze(dim=0)
             )
+        else:
+            # 1, dynamic_bs_split, layer_num, topk
+            layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
+                layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
+            ).unsqueeze(dim=0)
+            replay_mask_rmpad_split = None
+            if replay_mask_rmpad is not None:
+                replay_mask_rmpad_split = scatter_to_sequence_parallel_region(
+                    replay_mask_rmpad.to(device_name).squeeze(dim=0)
+                )
 
         # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk
         layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(

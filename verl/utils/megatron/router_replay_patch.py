@@ -27,6 +27,23 @@ _REPLAY_REQUIRED_SYMBOLS = (
 )
 _REPLAY_IMPORT_ERROR = None
 _INT16_MAX = torch.iinfo(torch.int16).max
+_INT8_MAX = torch.iinfo(torch.uint8).max
+
+
+def _replay_storage_dtype(num_experts: int | None) -> torch.dtype | None:
+    """Smallest unsigned/signed dtype that can hold expert ids (uint8 < int16 < int64).
+
+    Expert ids are non-negative and bounded by ``num_experts - 1``; packing them in
+    uint8 halves route-cache/TQ bytes versus int16 (runbook 14.x). Callers cast to
+    int64 on use (``gather``/``index``), so the storage dtype is free to shrink.
+    """
+    if num_experts is None:
+        return None
+    if num_experts <= _INT8_MAX + 1:
+        return torch.uint8
+    if num_experts <= _INT16_MAX:
+        return torch.int16
+    return None
 
 try:
     from megatron.core.transformer.moe.moe_utils import (
@@ -118,9 +135,10 @@ class RouterReplay:
         return self.recorded_topk_idx
 
     def record_indices(self, topk_indices: torch.Tensor, num_experts: int | None = None):
-        """Records the topk indices, compressing to int16 when expert ids fit."""
-        if num_experts is not None and num_experts <= _INT16_MAX:
-            topk_indices = topk_indices.to(torch.int16)
+        """Records the topk indices with the smallest dtype that fits the expert ids."""
+        storage_dtype = _replay_storage_dtype(num_experts)
+        if storage_dtype is not None:
+            topk_indices = topk_indices.to(storage_dtype)
         self.recorded_topk_idx = topk_indices
 
     def get_replay_topk(self, scores, topk, num_groups=None, group_topk=None, default_compute_topk=None):
@@ -142,18 +160,39 @@ class RouterReplay:
 
         indices = indices.to(device=scores.device, dtype=torch.int64)
         if replay_mask is not None:
-            _, native_indices = default_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
-            if indices.shape != native_indices.shape or replay_mask.numel() != scores.shape[0]:
+            if indices.shape[0] != scores.shape[0] or replay_mask.numel() != scores.shape[0]:
                 raise RuntimeError(
                     "Router replay tensors are not aligned: "
                     f"scores={tuple(scores.shape)}, targets={tuple(indices.shape)}, "
-                    f"native={tuple(native_indices.shape)}, mask={tuple(replay_mask.shape)}"
+                    f"mask={tuple(replay_mask.shape)}"
                 )
             if replay_mask.dtype != torch.bool:
                 replay_mask = replay_mask.bool()
             if replay_mask.device != scores.device:
                 replay_mask = replay_mask.to(scores.device)
-            indices = torch.where(replay_mask.unsqueeze(-1), indices, native_indices)
+            # Only rows left native need the native topk. R3 marks almost every row for
+            # replay (all but the last response row of each sequence), so computing the
+            # native topk for the full [rows, experts] score matrix every layer is wasted
+            # work. Restricted/unbalanced group routing keeps the full-score path because
+            # group_limited_topk depends on the original token count.
+            native_rows = ~replay_mask
+            if native_rows.all():
+                _, native_indices = default_compute_topk(
+                    scores, topk, num_groups=num_groups, group_topk=group_topk
+                )
+                return scores.gather(1, native_indices), native_indices
+            if not native_rows.any():
+                return scores.gather(1, indices), indices
+            if num_groups or group_topk:
+                _, native_indices = default_compute_topk(
+                    scores, topk, num_groups=num_groups, group_topk=group_topk
+                )
+                indices = torch.where(replay_mask.unsqueeze(-1), indices, native_indices)
+            else:
+                native_indices = indices.clone()
+                _, native_sub = torch.topk(scores[native_rows], k=topk, dim=1)
+                native_indices[native_rows] = native_sub
+                indices = native_indices
         return scores.gather(1, indices), indices
 
     def clear_indices(self):

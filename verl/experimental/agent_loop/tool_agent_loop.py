@@ -45,6 +45,29 @@ SPEC_DECODE_EXTRA_KEYS = (
 )
 
 
+
+def merge_turn_routed_experts(accumulated: torch.Tensor | None, new_routes: torch.Tensor) -> torch.Tensor:
+    """Merge one turn's routed-experts capture into the accumulated multi-turn buffer.
+
+    Each turn's vLLM capture only covers the rows the engine actually recomputed. With
+    prefix caching the cached prefix is served from KV cache and comes back as zeros, so
+    replacing the accumulated buffer (the previous behaviour) would drop the routes
+    recorded by earlier turns. Merge by absolute token position and keep already-recorded
+    rows where the new capture has no route (all-zero row).
+    """
+    if accumulated is None:
+        return new_routes
+    rows = max(accumulated.shape[0], new_routes.shape[0])
+    merged = accumulated.new_zeros((rows, *accumulated.shape[1:]))
+    merged[: accumulated.shape[0]] = accumulated
+    # Newly appended conversation rows only exist in the newest capture.
+    recorded = new_routes.flatten(1).ne(0).any(dim=-1)
+    head = min(rows, new_routes.shape[0])
+    merged[:head] = torch.where(
+        recorded[:head].view(-1, *([1] * (new_routes.dim() - 1))), new_routes[:head], merged[:head]
+    )
+    return merged
+
 class AgentState(Enum):
     PENDING = "pending"
     GENERATING = "generating"
@@ -286,7 +309,9 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.response_logprobs = response_logprobs
 
         if output.routed_experts is not None:
-            agent_data.routed_experts = output.routed_experts
+            agent_data.routed_experts = merge_turn_routed_experts(
+                agent_data.routed_experts, output.routed_experts
+            )
 
         # Check termination conditions
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
