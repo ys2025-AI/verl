@@ -469,6 +469,46 @@ def get_tensordict(tensor_dict: dict[str, torch.Tensor | list], non_tensor_dict:
     return TensorDict(source=tensor_dict, batch_size=batch_size)
 
 
+def _select_nested_tensor(tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """Select rows of a nested tensor by index, tolerating broken jagged layouts.
+
+    Fast path: ``unbind`` per sample and re-nest. Fallback (torch unbind bug on 3D+ jagged
+    NestedTensors, pytorch#153238 -- see also :func:`chunk_tensordict`): TransferQueue may pack
+    uniform-shape samples with the ragged axis on dim0 (e.g. mRoPE ``(4, seq)`` ->
+    ``[B, j4, seq]``) while ``_ragged_idx`` claims 2, which makes ``unbind`` split the wrong
+    dimension. Normalize ``_ragged_idx`` against the actual values/offsets, recover per-sample
+    tensors via ``to_padded_tensor`` + a plain dim-0 unbind, then:
+    - uniform shapes -> dense ``torch.stack`` (unambiguous; keeps ``(bsz, 4, seq)`` for mRoPE);
+    - otherwise -> verl canonical nested rebuild (``ragged_idx=2`` for 3D, matching
+      :func:`maybe_fix_3d_position_ids`).
+    """
+    try:
+        tensor_lst = tensor.unbind()
+        selected = [tensor_lst[idx] for idx in indices]
+        return nested_tensor_from_tensor_list(
+            selected, ragged_idx=getattr(tensor, "_ragged_idx", tensor.dim() - 1)
+        )
+    except RuntimeError:
+        offsets = tensor.offsets()
+        total = int(offsets[-1])
+        values = tensor._values
+        ragged_idx = getattr(tensor, "_ragged_idx", None)
+        if ragged_idx is not None and values.shape[ragged_idx - 1] != total:
+            for dim in range(values.dim()):
+                if values.shape[dim] == total:
+                    ragged_idx = dim + 1
+                    tensor._ragged_idx = ragged_idx
+                    break
+        padded = tensor.to_padded_tensor(0)
+        samples = torch.unbind(padded, dim=0)
+        selected = [samples[idx] for idx in indices]
+        if tensor.dim() == 3 and len({tuple(s.shape) for s in selected}) == 1:
+            return torch.stack(selected, dim=0)
+        return nested_tensor_from_tensor_list(
+            list(selected), ragged_idx=2 if tensor.dim() == 3 else ragged_idx
+        )
+
+
 def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int]) -> TensorDict:
     """Select rows from a TensorDict using indices.
 
@@ -506,11 +546,7 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
             if isinstance(tensor, torch.Tensor) and not tensor.is_nested:
                 data_dict[key] = tensor[indices]
             elif isinstance(tensor, torch.Tensor) and tensor.is_nested:
-                tensor_lst = tensor.unbind()  # for performance
-                selected_tensors = [tensor_lst[idx] for idx in indices]
-                data_dict[key] = nested_tensor_from_tensor_list(
-                    selected_tensors, ragged_idx=getattr(tensor, "_ragged_idx", tensor.dim() - 1)
-                )
+                data_dict[key] = _select_nested_tensor(tensor, indices)
             else:
                 # This handles NonTensorStack (indexable by batch dim) and NonTensorData (scalar metadata).
                 if tensor.shape:
