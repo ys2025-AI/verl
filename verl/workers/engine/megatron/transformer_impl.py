@@ -1395,6 +1395,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 local_cp_size=local_cp_size,
                 model=unwrapped_model,
                 routers=replay_routers,
+                data_format="bshd" if not self.engine_config.use_remove_padding else "thd",
+                forced_max_seqlen=tu.get_non_tensor_data(data=batch, key="forced_max_seqlen", default=None),
             )
 
         if pad_mode == DatasetPadMode.NO_PADDING:

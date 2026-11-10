@@ -39,6 +39,7 @@ from verl.models.mcore.util import (
     get_thd_quant_align_size,
     postprocess_packed_seqs,
     postprocess_thd_engine,
+    preprocess_bshd_engine,
     preprocess_packed_seqs,
     preprocess_thd_engine,
 )
@@ -453,6 +454,8 @@ def set_router_replay_data(
     local_cp_size=None,
     model=None,
     routers=None,
+    data_format="thd",
+    forced_max_seqlen=None,
 ):
     """
     Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
@@ -472,6 +475,10 @@ def set_router_replay_data(
             unmasked tokens keep native Megatron routes.
         model: The forwarded model (or list of VPP chunks). When given, targets are written to its own
             routers instead of a positional slice of the global RouterReplay.router_instances list.
+        data_format (str): "thd" packs routes to packed rows; "bshd" pads routes/mask to the same
+            padded [bs * max_seqlen] row layout the model forward uses.
+        forced_max_seqlen (Optional[int]): BSHD padding target used by the model forward
+            (``pad_bshd_to_minibatch_max``); must match so replay targets align with router scores.
 
     Returns:
         None: The function updates internal RouterReplay instances in-place.
@@ -491,6 +498,71 @@ def set_router_replay_data(
         )
 
         replay_mask_rmpad = None
+        if data_format == "bshd":
+            # BSHD forward pads every micro-batch to (forced) max_seqlen; router scores cover all
+            # padded rows, so replay targets must be padded the exact same way instead of packed.
+            if layers_topk_idx.is_nested:
+                quant_align_size = get_thd_quant_align_size(tf_config)
+                use_fp8_padding = quant_align_size is not None
+                layers_topk_idx_padded, _, _ = preprocess_bshd_engine(
+                    layers_topk_idx,
+                    pre_process=True,
+                    use_fp8_padding=use_fp8_padding,
+                    forced_max_seqlen=forced_max_seqlen,
+                )
+                if replay_mask is not None:
+                    replay_mask_padded, _, _ = preprocess_bshd_engine(
+                        replay_mask,
+                        pre_process=True,
+                        use_fp8_padding=use_fp8_padding,
+                        forced_max_seqlen=forced_max_seqlen,
+                    )
+                    replay_mask_rmpad = replay_mask_padded.reshape(-1)
+            else:
+                # Already padded dense [bs, seq, layer_num, topk].
+                layers_topk_idx_padded = layers_topk_idx
+                if replay_mask is not None:
+                    replay_mask_rmpad = replay_mask.reshape(-1)
+
+            if mpu.get_tensor_model_parallel_world_size() > 1:
+                raise NotImplementedError(
+                    "router replay REPLAY with data_format='bshd' is only verified with "
+                    "tensor_model_parallel_size=1 (sequence parallelism splits padded rows)."
+                )
+            batch_rows = layers_topk_idx_padded.shape[0] * layers_topk_idx_padded.shape[1]
+            layers_topk_idx_reshape = layers_topk_idx_padded.permute(2, 0, 1, 3).reshape(
+                layers_topk_idx_padded.shape[2], batch_rows, layers_topk_idx_padded.shape[3]
+            )
+            index_by_layer = layers_topk_idx_reshape.shape[0] == tf_config.num_layers
+
+            if model is None:
+                raise NotImplementedError(
+                    "router replay REPLAY with data_format='bshd' requires the forwarded model "
+                    "(forward_step always passes it)."
+                )
+            model_routers = list(routers) if routers is not None else list(iter_model_routers(model))
+            if not model_routers:
+                raise RuntimeError("router_replay REPLAY found no routers in the forwarded model.")
+
+            missing_layer_numbers = []
+            for layer_number, router in model_routers:
+                layer_idx = layer_number - 1
+                idx = layer_idx if index_by_layer else sum(1 for i in range(layer_idx) if is_moe_layer(tf_config, i))
+                if not 0 <= idx < layers_topk_idx_reshape.shape[0]:
+                    missing_layer_numbers.append(layer_number)
+                    continue
+                router.set_target_indices(
+                    layers_topk_idx_reshape[idx].to(_replay_index_dtype(tf_config)),
+                    replay_mask=replay_mask_rmpad,
+                )
+            if missing_layer_numbers:
+                raise RuntimeError(
+                    "router_replay REPLAY data does not cover every forwarded MoE layer: "
+                    f"missing_layer_numbers={missing_layer_numbers}, route_layers={layers_topk_idx_reshape.shape[0]}, "
+                    f"vp_rank={vp_rank}"
+                )
+            return
+
         if layers_topk_idx.is_nested:
             layers_topk_idx_rmpad, _, _ = preprocess_thd_engine(
                 layers_topk_idx,
