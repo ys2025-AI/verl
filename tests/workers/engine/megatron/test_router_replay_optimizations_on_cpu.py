@@ -21,6 +21,7 @@ Covers:
 - TransferQueue field projection for the reference policy
 - P1-4 local PP/VPP layer slicing and route-index mapping
 - P1-5 exact dispatcher output count cache (no per-layer `.item()`)
+- P2-7 ragged route storage (short route tensors pad back to native rows)
 """
 
 from types import SimpleNamespace
@@ -198,8 +199,26 @@ def test_prepare_r3_router_replay_data_unrecorded_rows_go_native():
     assert mask.unbind()[0].tolist() == [True, False, True, True, False, False]
 
 
+def test_prepare_r3_router_replay_data_pads_ragged_short_routes():
+    """Ragged route storage (P2-7): fewer recorded rows than tokens pad to native rows."""
+    lens = [6, 5]
+    routes = _nested_routes([torch.ones(4, 2, 2, dtype=torch.uint8), torch.ones(5, 2, 2, dtype=torch.uint8)])
+    input_ids = torch.nested.nested_tensor_from_jagged(
+        torch.zeros(sum(lens), dtype=torch.int64), offsets=torch.tensor([0, lens[0], sum(lens)])
+    )
+    response_mask = torch.ones(2, 6, dtype=torch.int64)
+
+    aligned, mask = rr_utils.prepare_r3_router_replay_data(routes, input_ids, response_mask)
+    parts = aligned.unbind()
+    mask_parts = mask.unbind()
+    assert [part.shape[0] for part in parts] == lens
+    # padded rows are zero => native, last row always native
+    assert mask_parts[0].tolist() == [True, True, True, True, False, False]
+    assert mask_parts[1].tolist() == [True, True, True, True, False]
+
+
 def test_prepare_r3_router_replay_data_rejects_bad_route_len():
-    routes = _nested_routes([torch.ones(2, 2, 2, dtype=torch.int16)])
+    routes = _nested_routes([torch.ones(7, 2, 2, dtype=torch.int16)])
     input_ids = torch.nested.nested_tensor_from_jagged(torch.zeros(6, dtype=torch.int64), offsets=torch.tensor([0, 6]))
     with pytest.raises(RuntimeError, match="route rows"):
         rr_utils.prepare_r3_router_replay_data(routes, input_ids, torch.ones(1, 6, dtype=torch.int64))

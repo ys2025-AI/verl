@@ -404,13 +404,17 @@ def _r3_route_parts(layers_topk_idx, input_ids, response_mask):
         route_len = routes.shape[0]
         if route_len == input_len:
             aligned = routes
-        elif route_len == input_len - 1:
-            placeholder = torch.zeros((1, *routes.shape[1:]), dtype=routes.dtype, device=routes.device)
+        elif route_len < input_len:
+            # Rollout only records rows the engine recomputed (one missing tail row for
+            # single-turn, more for prefix-cached multi-turn). Pad with zero rows; the
+            # replay mask above keeps those rows native (P2-7 ragged storage).
+            pad_rows = input_len - route_len
+            placeholder = torch.zeros((pad_rows, *routes.shape[1:]), dtype=routes.dtype, device=routes.device)
             aligned = torch.cat((routes, placeholder), dim=0)
         else:
             raise RuntimeError(
                 f"R3 router replay sample {sample_id} has {route_len} route rows for {input_len} input tokens; "
-                "expected equal lengths or exactly one missing final route"
+                "expected at most the sequence length"
             )
         # Replay every causal row that can influence response logprobs, skipping only the
         # final response row. Rows without a recorded route (all-zero: prefix-cached turns
@@ -499,13 +503,14 @@ def align_r3_router_replay_data(layers_topk_idx: torch.Tensor, input_ids: torch.
         route_len = routes.shape[0]
         if route_len == input_len:
             aligned_parts.append(routes)
-        elif route_len == input_len - 1:
-            placeholder = torch.zeros((1, *routes.shape[1:]), dtype=routes.dtype, device=routes.device)
+        elif route_len < input_len:
+            pad_rows = input_len - route_len
+            placeholder = torch.zeros((pad_rows, *routes.shape[1:]), dtype=routes.dtype, device=routes.device)
             aligned_parts.append(torch.cat((routes, placeholder), dim=0))
         else:
             raise RuntimeError(
                 f"R3 router replay sample {sample_id} has {route_len} route rows for {input_len} input tokens; "
-                "expected equal lengths or exactly one missing final route"
+                "expected at most the sequence length"
             )
     return torch.nested.as_nested_tensor(aligned_parts, layout=torch.jagged)
 
