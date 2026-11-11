@@ -14,6 +14,7 @@
 import inspect
 import types
 import warnings
+import weakref
 from enum import Enum
 from functools import wraps
 
@@ -28,6 +29,32 @@ _REPLAY_REQUIRED_SYMBOLS = (
 _REPLAY_IMPORT_ERROR = None
 _INT16_MAX = torch.iinfo(torch.int16).max
 _INT8_MAX = torch.iinfo(torch.uint8).max
+
+# Exact number of routed (token, expert) pairs keyed by routing-map identity.
+# Duplicate replayed routes collapse in routing_map, so the dispatcher cannot use
+# ``num_tokens * topk``; computing ``routing_map.sum().item()`` per layer forces a
+# device sync on every (re)compute. The replay target already determines the count,
+# so cache it once and hand it to the dispatcher through the routing_map it built.
+# Values hold a weakref so a recycled id() can never return a stale count (P1-5).
+_REPLAY_NUM_OUT_TOKENS: dict[int, tuple[weakref.ref, int]] = {}
+
+
+def _remember_num_out_tokens(routing_map: torch.Tensor, count: int) -> None:
+    try:
+        _REPLAY_NUM_OUT_TOKENS[id(routing_map)] = (weakref.ref(routing_map), int(count))
+    except TypeError:
+        # Some tensor subclasses are not weak-referenceable; fall back to .item().
+        pass
+
+
+def _pop_num_out_tokens(routing_map: torch.Tensor) -> int | None:
+    entry = _REPLAY_NUM_OUT_TOKENS.pop(id(routing_map), None)
+    if entry is None:
+        return None
+    ref, count = entry
+    if ref() is not routing_map:
+        return None
+    return count
 
 
 def _replay_storage_dtype(num_experts: int | None) -> torch.dtype | None:
@@ -119,16 +146,34 @@ class RouterReplay:
         self.router_replay_action = None  # Router replay action for this layer
         self.replay_backward_list = []  # List of tensors for backward pass replay
         self.replay_backward_mask_list = []
+        # Exact number of (token, expert) pairs this layer's target produces, precomputed
+        # once per micro-batch so the dispatcher never has to sync (P1-5). The slot serves
+        # REPLAY_FORWARD (one set -> one forward); the FIFO queue serves REPLAY_BACKWARD,
+        # mirroring ``replay_backward_list`` so counts survive pipeline schedules where
+        # forward of micro-batch i+1 runs before backward recompute of micro-batch i (PP>1).
+        self.replay_num_out_tokens = None
+        self.replay_num_out_tokens_list = []
+        # Transient count for the routing call in flight; set by ``get_replay_topk`` and
+        # consumed by the routing wrapper when the routing_map is built. Never read
+        # across calls, so interleaved micro-batches cannot clobber it.
+        self._pending_num_out_tokens = None
         RouterReplay.router_instances.append(self)
 
-    def set_target_indices(self, topk_indices: torch.Tensor, replay_mask: torch.Tensor | None = None):
+    def set_target_indices(
+        self,
+        topk_indices: torch.Tensor,
+        replay_mask: torch.Tensor | None = None,
+        num_out_tokens: int | None = None,
+    ):
         """Sets the target topk indices for replay."""
         if replay_mask is not None and replay_mask.dtype != torch.bool:
             replay_mask = replay_mask.to(torch.bool)
         self.target_topk_idx = topk_indices
         self.target_replay_mask = replay_mask
+        self.replay_num_out_tokens = num_out_tokens
         self.replay_backward_list.append(topk_indices)
         self.replay_backward_mask_list.append(replay_mask)
+        self.replay_num_out_tokens_list.append(num_out_tokens)
 
     def get_recorded_indices(self):
         """Returns the recorded topk indices."""
@@ -144,6 +189,9 @@ class RouterReplay:
     def get_replay_topk(self, scores, topk, num_groups=None, group_topk=None, default_compute_topk=None):
         """Select native or replayed experts using the current replay action."""
         action = self.router_replay_action
+        # The count is consumed by the caller within this routing call; reset per call so
+        # fallback paths never publish a stale value (P1-5).
+        self._pending_num_out_tokens = None
         if action == RouterReplayAction.RECORD:
             probs, indices = default_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
             self.record_indices(indices, num_experts=scores.shape[-1])
@@ -152,9 +200,13 @@ class RouterReplay:
         if action == RouterReplayAction.REPLAY_FORWARD and self.target_topk_idx is not None:
             indices = self.target_topk_idx
             replay_mask = self.target_replay_mask
+            self._pending_num_out_tokens = self.replay_num_out_tokens
         elif action == RouterReplayAction.REPLAY_BACKWARD and self.replay_backward_list:
             indices = self.replay_backward_list.pop(0)
             replay_mask = self.replay_backward_mask_list.pop(0)
+            self._pending_num_out_tokens = (
+                self.replay_num_out_tokens_list.pop(0) if self.replay_num_out_tokens_list else None
+            )
         else:
             return default_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
 
@@ -200,8 +252,16 @@ class RouterReplay:
         self.recorded_topk_idx = None
         self.target_topk_idx = None
         self.target_replay_mask = None
+        self.replay_num_out_tokens = None
+        self.replay_num_out_tokens_list = []
+        self._pending_num_out_tokens = None
         self.replay_backward_list = []
         self.replay_backward_mask_list = []
+
+    @staticmethod
+    def clear_num_out_tokens_cache():
+        """Drop cached dispatcher counts from the previous micro-batch (P1-5)."""
+        _REPLAY_NUM_OUT_TOKENS.clear()
 
     def set_router_replay_action(self, router_replay_action: RouterReplayAction):
         """Sets the router replay action for this layer."""
@@ -300,6 +360,22 @@ def _patched_topk_routing_with_score_function(
         # TODO Try using element-wise operations instead of scatter?
         routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+
+    if router_replay is not None:
+        # Native rows always pick `topk` distinct experts; only replayed rows can
+        # collapse duplicates. Precomputed target counts avoid a device sync in the
+        # dispatcher (P1-5); missing counts fall back to `.item()` there. The pending
+        # value was resolved by `get_replay_topk` within this same routing call, so it
+        # always belongs to the micro-batch that built this routing_map (PP>1 safe).
+        if router_replay.router_replay_action in (
+            RouterReplayAction.REPLAY_FORWARD,
+            RouterReplayAction.REPLAY_BACKWARD,
+        ):
+            count = router_replay._pending_num_out_tokens
+        else:
+            count = num_tokens * topk
+        if count is not None:
+            _remember_num_out_tokens(routing_map, count)
 
     return routing_probs, routing_map
 
@@ -436,7 +512,13 @@ def apply_router_replay_patch():
                     or getattr(self.config, "moe_router_padding_for_fp8", None)
                 )
             ):
-                self.num_out_tokens = int(routing_map.sum().item())
+                # Prefer the count cached when the routing_map was built (P1-5).
+                # `.item()` remains the correctness fallback for paths we cannot
+                # precompute (e.g. learned-router replay handled inside MCore).
+                num_out_tokens = _pop_num_out_tokens(routing_map)
+                if num_out_tokens is None:
+                    num_out_tokens = int(routing_map.sum().item())
+                self.num_out_tokens = num_out_tokens
             return result
 
         MoEAlltoAllTokenDispatcher.preprocess = patched_preprocess

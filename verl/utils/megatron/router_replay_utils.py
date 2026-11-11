@@ -534,6 +534,119 @@ def _replay_index_dtype(tf_config):
     return torch.int64
 
 
+def _moe_layer_ordinal(tf_config, layer_idx: int) -> int:
+    """Number of MoE layers with a global index below ``layer_idx``."""
+    return sum(1 for i in range(layer_idx) if is_moe_layer(tf_config, i))
+
+
+def _local_layer_range(tf_config, vp_rank) -> tuple[int, int]:
+    """Global ``[start, end)`` layer range owned by this PP rank / VPP stage."""
+    pp_size = int(getattr(tf_config, "pipeline_model_parallel_size", 1) or 1)
+    vp_size = int(getattr(tf_config, "virtual_pipeline_model_parallel_size", None) or 1)
+    if pp_size <= 1 and vp_size <= 1:
+        return 0, int(tf_config.num_layers)
+    try:
+        info = get_current_rank_layer_info(tf_config, vp_rank)
+    except (AssertionError, RuntimeError):
+        # Unit tests and some non-distributed callers do not initialize Megatron's
+        # parallel state. Skipping the slice keeps the legacy full-layer mapping.
+        return 0, int(tf_config.num_layers)
+    return int(info["start"]), int(info["end"])
+
+
+def _slice_route_layers(layers_topk_idx, lo: int, hi: int):
+    """Return route layers ``[lo, hi)`` preserving the input (nested or dense) layout."""
+    if layers_topk_idx.is_nested:
+        # Route tensors are [bs, j, layer, topk]; only the ragged dim cannot be sliced,
+        # so slice the jagged values buffer and rebuild on the same offsets.
+        if getattr(layers_topk_idx, "_ragged_idx", 1) != 1:
+            parts = [part[:, lo:hi, :].contiguous() for part in layers_topk_idx.unbind()]
+            return torch.nested.as_nested_tensor(parts, layout=torch.jagged)
+        return torch.nested.nested_tensor_from_jagged(
+            layers_topk_idx.values()[:, lo:hi, :].contiguous(),
+            offsets=layers_topk_idx.offsets(),
+        )
+    return layers_topk_idx[:, :, lo:hi, :].contiguous()
+
+
+def _restrict_routes_to_local_layers(layers_topk_idx, tf_config, vp_rank):
+    """Slice a full-model route tensor down to this rank's layers before packing (P1-4).
+
+    R3 route targets carry one route per model layer. Every PP rank packing and
+    scattering all layers wastes work proportional to the pipeline size; only the
+    layers owned by this ``(pp_rank, vp_stage)`` are replayed locally.
+
+    Returns ``(routes, scope, base)``:
+    - ``scope`` is ``"by_layer"`` when route dim 2 is indexed by the absolute global
+      layer id, ``"by_moe_ordinal"`` when it only spans MoE layers, or ``None`` for
+      an unrecognized layout (caller keeps the legacy validation path);
+    - ``base`` is the global layer index (or MoE ordinal) of route dim 0 after slicing.
+    """
+    route_layers = int(layers_topk_idx.size(2))
+    num_layers = int(tf_config.num_layers)
+    if route_layers == num_layers:
+        scope = "by_layer"
+    elif route_layers == _moe_layer_ordinal(tf_config, num_layers):
+        scope = "by_moe_ordinal"
+    else:
+        return layers_topk_idx, None, 0
+
+    abs_start, abs_end = _local_layer_range(tf_config, vp_rank)
+    if scope == "by_layer":
+        lo, hi = abs_start, abs_end
+    else:
+        lo = _moe_layer_ordinal(tf_config, abs_start)
+        hi = lo + sum(1 for i in range(abs_start, abs_end) if is_moe_layer(tf_config, i))
+    if (lo, hi) == (0, route_layers):
+        return layers_topk_idx, scope, 0
+    return _slice_route_layers(layers_topk_idx, lo, hi), scope, lo
+
+
+def _route_layer_index(tf_config, layer_number: int, scope, base: int, route_len: int) -> int:
+    """Map a global 1-based router layer number to an index into route dim 0."""
+    layer_idx = layer_number - 1
+    if scope == "by_layer":
+        return layer_idx - base
+    if scope == "by_moe_ordinal":
+        return _moe_layer_ordinal(tf_config, layer_idx) - base
+    return layer_idx if route_len == tf_config.num_layers else _moe_layer_ordinal(tf_config, layer_idx)
+
+
+def _replay_num_out_tokens_per_layer(layers_topk_idx_reshape, replay_mask) -> list[int] | None:
+    """Exact number of routed (token, expert) pairs per layer, computed once (P1-5).
+
+    ``MoEAlltoAllTokenDispatcher.preprocess`` must know the exact number of set
+    entries in ``routing_map`` because duplicated replayed routes collapse. The
+    upstream formula ``num_tokens * topk`` overestimates then, and
+    ``routing_map.sum().item()`` synchronizes the device on every layer and every
+    (re)compute. Compute all layers at once here and cache the Python ints.
+
+    Native rows always select ``topk`` distinct experts; replayed rows may repeat,
+    so their per-row distinct count is derived from the recorded target. Counts are
+    delivered per micro-batch through the RouterReplay FIFO queue, so pipeline
+    schedules that interleave micro-batches (PP>1) consume the count matching their
+    own replay target. Returns ``None`` when the mask cannot be aligned, in which
+    case callers fall back to the previous per-layer ``.item()`` path.
+    """
+    if layers_topk_idx_reshape.numel() == 0:
+        return None
+    topk = int(layers_topk_idx_reshape.shape[-1])
+    if topk <= 0:
+        return None
+    sorted_routes = layers_topk_idx_reshape.sort(dim=-1).values
+    unique_per_row = (sorted_routes[..., 1:] != sorted_routes[..., :-1]).sum(dim=-1) + 1
+    if replay_mask is None:
+        counts = unique_per_row.sum(dim=-1)
+    else:
+        mask = replay_mask
+        if mask.numel() != unique_per_row.shape[1]:
+            return None
+        mask = mask.to(device=unique_per_row.device, dtype=torch.bool)
+        replay_counts = unique_per_row[:, mask].sum(dim=-1)
+        counts = replay_counts + (~mask).sum().to(replay_counts.dtype) * topk
+    return [int(count) for count in counts.tolist()]
+
+
 def set_router_replay_data(
     layers_topk_idx,
     attention_mask,
@@ -586,6 +699,15 @@ def set_router_replay_data(
             else None
         )
 
+        # P1-4: drop other PP/VPP ranks' layers before pack/scatter. The mapping
+        # back to global layer ids is carried by (route_scope, route_base).
+        layers_topk_idx, route_scope, route_base = _restrict_routes_to_local_layers(
+            layers_topk_idx, tf_config, vp_rank
+        )
+        # Drop counts from the previous micro-batch so stale routing_map ids cannot
+        # be reused (P1-5).
+        RouterReplay.clear_num_out_tokens_cache()
+
         replay_mask_rmpad = None
         if data_format == "bshd":
             # BSHD forward pads every micro-batch to (forced) max_seqlen; router scores cover all
@@ -622,7 +744,8 @@ def set_router_replay_data(
             layers_topk_idx_reshape = layers_topk_idx_padded.permute(2, 0, 1, 3).reshape(
                 layers_topk_idx_padded.shape[2], batch_rows, layers_topk_idx_padded.shape[3]
             )
-            index_by_layer = layers_topk_idx_reshape.shape[0] == tf_config.num_layers
+            route_len = layers_topk_idx_reshape.shape[0]
+            num_out_tokens = _replay_num_out_tokens_per_layer(layers_topk_idx_reshape, replay_mask_rmpad)
 
             if model is None:
                 raise NotImplementedError(
@@ -635,14 +758,14 @@ def set_router_replay_data(
 
             missing_layer_numbers = []
             for layer_number, router in model_routers:
-                layer_idx = layer_number - 1
-                idx = layer_idx if index_by_layer else sum(1 for i in range(layer_idx) if is_moe_layer(tf_config, i))
-                if not 0 <= idx < layers_topk_idx_reshape.shape[0]:
+                idx = _route_layer_index(tf_config, layer_number, route_scope, route_base, route_len)
+                if not 0 <= idx < route_len:
                     missing_layer_numbers.append(layer_number)
                     continue
                 router.set_target_indices(
                     layers_topk_idx_reshape[idx].to(_replay_index_dtype(tf_config)),
                     replay_mask=replay_mask_rmpad,
+                    num_out_tokens=None if num_out_tokens is None else num_out_tokens[idx],
                 )
             if missing_layer_numbers:
                 raise RuntimeError(
@@ -708,7 +831,8 @@ def set_router_replay_data(
         # When dim-0 covers all layers (e.g. R3, or R2 with all-MoE models),
         # index by absolute layer_idx; otherwise (R2 with mixed dense/MoE),
         # dim-0 only contains MoE layers, index by MoE-layer ordinal.
-        index_by_layer = len(layers_topk_idx_reshape) == tf_config.num_layers
+        route_len = len(layers_topk_idx_reshape)
+        num_out_tokens = _replay_num_out_tokens_per_layer(layers_topk_idx_reshape, replay_mask_rmpad_split)
 
         if model is not None:
             model_routers = list(routers) if routers is not None else list(iter_model_routers(model))
@@ -717,14 +841,14 @@ def set_router_replay_data(
 
             missing_layer_numbers = []
             for layer_number, router in model_routers:
-                layer_idx = layer_number - 1
-                idx = layer_idx if index_by_layer else sum(1 for i in range(layer_idx) if is_moe_layer(tf_config, i))
-                if not 0 <= idx < layers_topk_idx_reshape.shape[0]:
+                idx = _route_layer_index(tf_config, layer_number, route_scope, route_base, route_len)
+                if not 0 <= idx < route_len:
                     missing_layer_numbers.append(layer_number)
                     continue
                 router.set_target_indices(
                     layers_topk_idx_reshape[idx].to(_replay_index_dtype(tf_config)),
                     replay_mask=replay_mask_rmpad_split,
+                    num_out_tokens=None if num_out_tokens is None else num_out_tokens[idx],
                 )
             if missing_layer_numbers:
                 raise RuntimeError(
@@ -746,10 +870,16 @@ def set_router_replay_data(
             if not is_moe_layer(tf_config, layer_idx):
                 continue
             router = router_instances_list[router_offset]
-            idx = layer_idx if index_by_layer else moe_idx
+            if route_scope == "by_layer":
+                idx = layer_idx - route_base
+            elif route_scope == "by_moe_ordinal":
+                idx = moe_idx - route_base
+            else:
+                idx = layer_idx if route_len == tf_config.num_layers else moe_idx
             router.set_target_indices(
                 layers_topk_idx_reshape[idx].to(_replay_index_dtype(tf_config)),
                 replay_mask=replay_mask_rmpad_split,
+                num_out_tokens=None if num_out_tokens is None else num_out_tokens[idx],
             )
             router_offset += 1
             moe_idx += 1

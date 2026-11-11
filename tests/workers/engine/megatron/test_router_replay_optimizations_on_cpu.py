@@ -19,6 +19,8 @@ Covers:
 - prepare_r3_router_replay_data single-pass align+mask (incl. unrecorded rows)
 - multi-turn route merge
 - TransferQueue field projection for the reference policy
+- P1-4 local PP/VPP layer slicing and route-index mapping
+- P1-5 exact dispatcher output count cache (no per-layer `.item()`)
 """
 
 from types import SimpleNamespace
@@ -258,3 +260,224 @@ def test_project_batch_fields_excludes_routes():
     meta_all = KVBatchMeta(keys=["k"], tags=[{}], partition_id="train", fields=None, extra_info={})
     with patch("verl.trainer.ppo.v1.trainer_base.KVBatchMeta", KVBatchMeta):
         assert _project_batch_fields(meta_all, exclude={"routed_experts"}) is meta_all
+
+
+# --------------------------------------------------------------------------- #
+# P1-4: restrict packing to the local PP/VPP layer range
+# --------------------------------------------------------------------------- #
+def _pp_config(num_layers, pp_size, moe_layer_freq=1):
+    return SimpleNamespace(
+        num_layers=num_layers,
+        pipeline_model_parallel_size=pp_size,
+        virtual_pipeline_model_parallel_size=None,
+        moe_layer_freq=moe_layer_freq,
+    )
+
+
+def _routes_with_layers(num_layers, rows=3, topk=2):
+    part = torch.arange(rows * num_layers * topk, dtype=torch.int64).reshape(rows, num_layers, topk)
+    return torch.nested.as_nested_tensor([part], layout=torch.jagged)
+
+
+def test_restrict_routes_to_local_layers_by_layer(monkeypatch):
+    cfg = _pp_config(num_layers=4, pp_size=2)
+    monkeypatch.setattr(rr_utils, "get_current_rank_layer_info", lambda *a, **k: {"start": 2, "end": 4, "count": 2})
+    routes = _routes_with_layers(4)
+    restricted, scope, base = rr_utils._restrict_routes_to_local_layers(routes, cfg, vp_rank=0)
+
+    assert (scope, base) == ("by_layer", 2)
+    assert restricted.size(2) == 2
+    assert restricted.values().shape[0] == 3
+    assert torch.equal(restricted.unbind()[0][0], routes.unbind()[0][0, 2:4])
+    # global layer 3 maps into the local slice as index 1
+    assert rr_utils._route_layer_index(cfg, 4, scope, base, restricted.size(2)) == 1
+
+
+def test_restrict_routes_to_local_layers_by_moe_ordinal(monkeypatch):
+    # MoE on even layers only: global 0 and 2 are MoE, PP stage 1 owns layers 2..4.
+    cfg = _pp_config(num_layers=4, pp_size=2, moe_layer_freq=2)
+    monkeypatch.setattr(rr_utils, "get_current_rank_layer_info", lambda *a, **k: {"start": 2, "end": 4, "count": 2})
+    routes = _routes_with_layers(2)  # only MoE layers
+    restricted, scope, base = rr_utils._restrict_routes_to_local_layers(routes, cfg, vp_rank=0)
+
+    assert (scope, base) == ("by_moe_ordinal", 1)
+    assert restricted.size(2) == 1
+    # global layer 3 (index 2) is the second MoE layer; minus base 1 -> local 0
+    assert rr_utils._route_layer_index(cfg, 3, scope, base, restricted.size(2)) == 0
+
+
+def test_restrict_routes_to_local_layers_is_noop_without_pp():
+    cfg = _pp_config(num_layers=4, pp_size=1)
+    routes = _routes_with_layers(4)
+    restricted, scope, base = rr_utils._restrict_routes_to_local_layers(routes, cfg, vp_rank=0)
+    assert restricted is routes
+    assert (scope, base) == ("by_layer", 0)
+
+
+def test_restrict_routes_to_local_layers_unknown_layout_passthrough():
+    cfg = _pp_config(num_layers=4, pp_size=2)
+    routes = _routes_with_layers(3)  # matches neither num_layers nor MoE count
+    restricted, scope, base = rr_utils._restrict_routes_to_local_layers(routes, cfg, vp_rank=0)
+    assert restricted is routes and scope is None and base == 0
+
+
+# --------------------------------------------------------------------------- #
+# P1-5: exact dispatcher output count without a per-layer .item()
+# --------------------------------------------------------------------------- #
+def test_replay_num_out_tokens_per_layer_native_rows():
+    routes = torch.tensor(
+        [
+            [[1, 2], [3, 3], [4, 5]],
+            [[6, 6], [7, 8], [9, 9]],
+        ],
+        dtype=torch.uint8,
+    )  # [2 layers, 3 rows, 2 topk]
+    assert rr_utils._replay_num_out_tokens_per_layer(routes, None) == [5, 4]
+
+
+def test_replay_num_out_tokens_per_layer_mixed_mask():
+    routes = torch.tensor([[[1, 1], [2, 3], [4, 5]]], dtype=torch.int16)  # 1 layer
+    mask = torch.tensor([True, True, False])  # one native row => contributes topk=2
+    assert rr_utils._replay_num_out_tokens_per_layer(routes, mask) == [1 + 2 + 2]
+
+
+def test_replay_num_out_tokens_per_layer_rejects_misaligned_mask():
+    routes = torch.ones(1, 2, 2, dtype=torch.int16)
+    assert rr_utils._replay_num_out_tokens_per_layer(routes, torch.ones(3, dtype=torch.bool)) is None
+
+
+def test_set_target_indices_caches_num_out_tokens_and_clear_resets():
+    router = rr_patch.RouterReplay()
+    router.set_target_indices(torch.zeros(2, 2, dtype=torch.int64), num_out_tokens=7)
+    assert router.replay_num_out_tokens == 7
+    router.clear_indices()
+    assert router.replay_num_out_tokens is None
+
+
+def test_num_out_tokens_cache_roundtrip_and_weakref_guard():
+    rr_patch.RouterReplay.clear_num_out_tokens_cache()
+    routing_map = torch.zeros(4, 8, dtype=torch.bool)
+    rr_patch._remember_num_out_tokens(routing_map, 12)
+    assert rr_patch._pop_num_out_tokens(routing_map) == 12
+    # entry is consumed once
+    assert rr_patch._pop_num_out_tokens(routing_map) is None
+    # a different tensor with the same id (stale weakref) must not hit
+    other = torch.zeros(4, 8, dtype=torch.bool)
+    rr_patch._remember_num_out_tokens(routing_map, 12)
+    assert rr_patch._pop_num_out_tokens(other) is None
+
+
+def test_patched_topk_publishes_precomputed_replay_count():
+    logits = torch.randn(3, 8)
+    router = rr_patch.RouterReplay()
+    router.set_router_replay_action(rr_patch.RouterReplayAction.REPLAY_FORWARD)
+    router.set_target_indices(torch.tensor([[1, 1], [2, 3], [4, 5]]), num_out_tokens=5)
+
+    _, routing_map = rr_patch._patched_topk_routing_with_score_function(
+        logits,
+        topk=2,
+        use_pre_softmax=False,
+        num_groups=None,
+        group_topk=None,
+        score_function="softmax",
+        expert_bias=None,
+        fused=False,
+        router_replay=router,
+        scaling_factor=None,
+    )
+    assert int(routing_map.sum()) == 5
+    assert rr_patch._pop_num_out_tokens(routing_map) == 5
+
+
+def test_patched_topk_publishes_native_count_for_record():
+    logits = torch.randn(4, 8)
+    router = rr_patch.RouterReplay()
+    router.set_router_replay_action(rr_patch.RouterReplayAction.RECORD)
+
+    _, routing_map = rr_patch._patched_topk_routing_with_score_function(
+        logits,
+        topk=2,
+        use_pre_softmax=False,
+        num_groups=None,
+        group_topk=None,
+        score_function="softmax",
+        expert_bias=None,
+        fused=False,
+        router_replay=router,
+        scaling_factor=None,
+    )
+    assert rr_patch._pop_num_out_tokens(routing_map) == 4 * 2
+    assert router.recorded_topk_idx is not None
+
+
+def _route_call(logits, router):
+    return rr_patch._patched_topk_routing_with_score_function(
+        logits,
+        topk=2,
+        use_pre_softmax=False,
+        num_groups=None,
+        group_topk=None,
+        score_function="softmax",
+        expert_bias=None,
+        fused=False,
+        router_replay=router,
+        scaling_factor=None,
+    )
+
+
+def test_replay_backward_pops_counts_fifo_across_pipeline_micro_batches():
+    """1F1B (PP>1): forward of micro-batch B overwrites the forward slot before the
+    backward recompute of micro-batch A runs. Counts must therefore be queued FIFO
+    like the replay indices, or the dispatcher gets a mismatched num_out_tokens and
+    the all-to-all backward fails with "Split sizes doesn't match total dim 0 size"."""
+    rr_patch.RouterReplay.clear_num_out_tokens_cache()
+    torch.manual_seed(0)
+    logits = torch.randn(3, 8)
+    router = rr_patch.RouterReplay()
+    targets_a = torch.tensor([[1, 1], [2, 3], [4, 5]])  # collapses to 5 unique pairs
+    targets_b = torch.tensor([[1, 2], [3, 4], [5, 6]])  # collapses to 6 unique pairs
+
+    # Micro-batch A: set + forward (REPLAY_FORWARD publishes A's count).
+    router.set_router_replay_action(rr_patch.RouterReplayAction.REPLAY_FORWARD)
+    router.set_target_indices(targets_a, num_out_tokens=5)
+    _, map_a_fwd = _route_call(logits, router)
+    assert int(map_a_fwd.sum()) == 5
+    assert rr_patch._pop_num_out_tokens(map_a_fwd) == 5
+
+    # Micro-batch B: set + forward; the forward slot now belongs to B.
+    router.set_router_replay_action(rr_patch.RouterReplayAction.REPLAY_FORWARD)
+    router.set_target_indices(targets_b, num_out_tokens=6)
+    _, map_b_fwd = _route_call(logits, router)
+    assert int(map_b_fwd.sum()) == 6
+    assert rr_patch._pop_num_out_tokens(map_b_fwd) == 6
+
+    # Backward of A (recompute under REPLAY_BACKWARD) must get A's count, not B's.
+    router.set_router_replay_action(rr_patch.RouterReplayAction.REPLAY_BACKWARD)
+    _, map_a_bwd = _route_call(logits, router)
+    assert int(map_a_bwd.sum()) == 5
+    assert rr_patch._pop_num_out_tokens(map_a_bwd) == 5
+
+    # Backward of B pops the next queued count.
+    _, map_b_bwd = _route_call(logits, router)
+    assert int(map_b_bwd.sum()) == 6
+    assert rr_patch._pop_num_out_tokens(map_b_bwd) == 6
+
+    # Exhausted queue falls back to the dispatcher's `.item()` path.
+    _, map_extra = _route_call(logits, router)
+    assert rr_patch._pop_num_out_tokens(map_extra) is None
+
+
+def test_replay_backward_without_queued_counts_publishes_nothing():
+    rr_patch.RouterReplay.clear_num_out_tokens_cache()
+    torch.manual_seed(0)
+    logits = torch.randn(3, 8)
+    router = rr_patch.RouterReplay()
+    # Targets queued without counts (e.g. legacy `set_replay_data` callers) must not
+    # publish a count; the dispatcher falls back to `routing_map.sum().item()`.
+    router.set_router_replay_action(rr_patch.RouterReplayAction.REPLAY_FORWARD)
+    router.set_target_indices(torch.tensor([[1, 1], [2, 3], [4, 5]]))
+    _, routing_map = _route_call(logits, router)
+    assert int(routing_map.sum()) == 5
+    assert rr_patch._pop_num_out_tokens(routing_map) is None
+
+

@@ -29,10 +29,12 @@ class _FakeRouter:
         self.router_replay_action = router_replay_action
         self.target_topk_idx = None
         self.target_replay_mask = None
+        self.replay_num_out_tokens = None
 
-    def set_target_indices(self, topk_indices, replay_mask=None):
+    def set_target_indices(self, topk_indices, replay_mask=None, num_out_tokens=None):
         self.target_topk_idx = topk_indices
         self.target_replay_mask = replay_mask
+        self.replay_num_out_tokens = num_out_tokens
 
     def set_router_replay_action(self, action):
         self.router_replay_action = action
@@ -551,3 +553,29 @@ def test_set_router_replay_data_uses_cached_routers(monkeypatch):
     )
 
     assert router.target_topk_idx is not None
+
+
+def test_set_router_replay_data_slices_to_local_pp_layers(monkeypatch):
+    """P1-4: only this PP rank's layers are packed/scattered, mapped by global id."""
+    routers = [_FakeRouter(), _FakeRouter()]
+    RouterReplay.router_instances = routers
+    tf_config = _config(num_layers=4)
+    routed_experts = torch.arange(1 * 3 * 4 * 2, dtype=torch.int64).reshape(1, 3, 4, 2)
+
+    monkeypatch.setattr(rr_utils, "device_name", "cpu")
+    monkeypatch.setattr(rr_utils, "get_current_rank_layer_info", lambda *a, **k: {"start": 2, "end": 4, "count": 2})
+    monkeypatch.setattr(
+        rr_utils, "preprocess_packed_seqs", lambda tensor, attention_mask, **_kwargs: (tensor, object())
+    )
+    monkeypatch.setattr(rr_utils, "scatter_to_sequence_parallel_region", lambda tensor: tensor)
+    monkeypatch.setattr(rr_utils, "iter_model_routers", lambda model: iter([(3, routers[0]), (4, routers[1])]))
+
+    rr_utils.set_router_replay_data(
+        routed_experts,
+        torch.ones(1, 3, dtype=torch.bool),
+        tf_config,
+        model=object(),
+    )
+
+    assert torch.equal(routers[0].target_topk_idx, routed_experts[0, :, 2, :])
+    assert torch.equal(routers[1].target_topk_idx, routed_experts[0, :, 3, :])

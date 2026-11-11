@@ -73,7 +73,9 @@ def test_router_record_and_replay_use_dynamic_cp_size(monkeypatch):
     assert recorded[0].dtype == torch.int16
 
     target = {}
-    router.set_target_indices = lambda indices, replay_mask=None: target.update(indices=indices, mask=replay_mask)
+    router.set_target_indices = lambda indices, replay_mask=None, num_out_tokens=None: target.update(
+        indices=indices, mask=replay_mask, num_out_tokens=num_out_tokens
+    )
     router_utils.set_router_replay_data(recorded[0], None, config, local_cp_size=2)
 
     assert calls == [2, 2, 2]
@@ -110,7 +112,9 @@ def test_r3_replay_uses_transformer_engine_padding_for_nvfp4(monkeypatch):
     calls = []
     target = {}
     router = SimpleNamespace(
-        set_target_indices=lambda indices, replay_mask=None: target.update(indices=indices, mask=replay_mask)
+        set_target_indices=lambda indices, replay_mask=None, num_out_tokens=None: target.update(
+            indices=indices, mask=replay_mask, num_out_tokens=num_out_tokens
+        )
     )
     monkeypatch.setattr(router_utils, "iter_model_routers", lambda _model: [(1, router)])
     monkeypatch.setattr(router_utils, "scatter_to_sequence_parallel_region", lambda tensor: tensor)
