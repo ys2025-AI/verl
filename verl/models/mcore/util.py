@@ -791,6 +791,33 @@ def postprocess_bshd_engine(
     return output_new_tensor
 
 
+def _nested_to_padded_dense(tensor: torch.Tensor, pad_value, max_seqlen: int) -> torch.Tensor:
+    """Pad a jagged [batch, j, ...] tensor into a preallocated dense buffer.
+
+    ``to_padded_tensor`` lowers to ``aten::_jagged_to_padded_dense_forward``, which
+    has no NPU kernel and falls back to the CPU (runbook 11.9 / P1-6). Copying each
+    sample straight into a zero-initialized buffer is faster on NPU and produces the
+    same left-aligned padded layout.
+    """
+    if not tensor.is_nested:
+        return tensor
+    batch_size = tensor.shape[0]
+    dense_shape = tuple(tensor.shape[2:])
+    padded = torch.full(
+        (batch_size, max_seqlen, *dense_shape),
+        pad_value,
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    offsets = tensor.offsets().tolist()
+    values = tensor.values()
+    for i in range(batch_size):
+        start, end = offsets[i], offsets[i + 1]
+        if end > start:
+            padded[i, : end - start].copy_(values[start:end])
+    return padded
+
+
 def build_vlm_attn_mask_thd(
     input_ids: torch.Tensor,
     pad_token_id: int = None,
@@ -818,7 +845,7 @@ def build_vlm_attn_mask_thd(
         max_seqlen += (align_size - max_seqlen % align_size) % align_size
 
     batch_size = input_ids.shape[0]
-    input_ids_with_pad = input_ids.to_padded_tensor(pad_token_id, output_size=(batch_size, max_seqlen))
+    input_ids_with_pad = _nested_to_padded_dense(input_ids, pad_token_id, max_seqlen)
     attention_mask = torch.zeros_like(input_ids_with_pad, dtype=torch.bool)
     for i, seqlen in enumerate(padded_lengths):
         attention_mask[i, :seqlen] = True
@@ -903,7 +930,7 @@ def build_vlm_attn_mask_bshd(
         pad_size = (align_size - max_seqlen % align_size) % align_size
         max_seqlen += pad_size
 
-    input_ids_bshd = input_ids.to_padded_tensor(pad_token_id, output_size=(batch_size, max_seqlen))
+    input_ids_bshd = _nested_to_padded_dense(input_ids, pad_token_id, max_seqlen)
 
     if is_npu_available:
         return input_ids_bshd, None

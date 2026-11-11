@@ -21,6 +21,7 @@ Covers:
 - TransferQueue field projection for the reference policy
 - P1-4 local PP/VPP layer slicing and route-index mapping
 - P1-5 exact dispatcher output count cache (no per-layer `.item()`)
+- P1-6 jagged -> dense padding without to_padded_tensor
 - P2-7 ragged route storage (short route tensors pad back to native rows)
 """
 
@@ -500,3 +501,52 @@ def test_replay_backward_without_queued_counts_publishes_nothing():
     assert rr_patch._pop_num_out_tokens(routing_map) is None
 
 
+# --------------------------------------------------------------------------- #
+# P1-6: nested -> dense without aten::_jagged_to_padded_dense_forward
+# --------------------------------------------------------------------------- #
+def test_nested_to_padded_dense_left_aligns_and_pads():
+    from verl.models.mcore.util import _nested_to_padded_dense
+
+    nested = torch.nested.as_nested_tensor(
+        [torch.tensor([1, 2, 3]), torch.tensor([4, 5])], layout=torch.jagged
+    )
+    dense = _nested_to_padded_dense(nested, 0, max_seqlen=4)
+    assert dense.tolist() == [[1, 2, 3, 0], [4, 5, 0, 0]]
+
+
+def test_nested_to_padded_dense_preserves_trailing_dims():
+    from verl.models.mcore.util import _nested_to_padded_dense
+
+    nested = torch.nested.as_nested_tensor(
+        [torch.ones(2, 3), torch.full((1, 3), 2.0)], layout=torch.jagged
+    )
+    dense = _nested_to_padded_dense(nested, -1.0, max_seqlen=3)
+    assert dense.shape == (2, 3, 3)
+    assert torch.equal(dense[0, :2], torch.ones(2, 3))
+    assert torch.equal(dense[0, 2], torch.full((3,), -1.0))
+    assert torch.equal(dense[1, 0], torch.full((3,), 2.0))
+
+
+def test_nested_to_padded_dense_passes_through_dense():
+    from verl.models.mcore.util import _nested_to_padded_dense
+
+    dense = torch.arange(6).reshape(2, 3)
+    assert _nested_to_padded_dense(dense, 0, max_seqlen=5) is dense
+
+
+def test_nested_to_padded_matches_to_padded_tensor():
+    from verl.utils.tensordict_utils import nested_to_padded
+
+    nested = torch.nested.as_nested_tensor(
+        [torch.tensor([1, 2, 3]), torch.tensor([4, 5])], layout=torch.jagged
+    )
+    expected = nested.to_padded_tensor(0)
+    got = nested_to_padded(nested, padding=0)
+    assert torch.equal(got, expected)
+
+
+def test_nested_to_padded_passes_dense_through():
+    from verl.utils.tensordict_utils import nested_to_padded
+
+    dense = torch.arange(6).reshape(2, 3)
+    assert nested_to_padded(dense, padding=-1) is dense

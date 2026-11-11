@@ -1127,8 +1127,8 @@ class PPOTrainer(ABC):
             text_data = tq.kv_batch_get(
                 keys=batch.keys, partition_id=batch.partition_id, select_fields=["prompts", "responses"]
             )
-            text_data["prompts"] = text_data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
-            text_data["responses"] = text_data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+            text_data["prompts"] = tu.nested_to_padded(text_data["prompts"], padding=self.tokenizer.pad_token_id)
+            text_data["responses"] = tu.nested_to_padded(text_data["responses"], padding=self.tokenizer.pad_token_id)
             all_inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["prompts"]]
             all_outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["responses"]]
 
@@ -1330,8 +1330,8 @@ class PPOTrainer(ABC):
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
-            data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
-            data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+            data["prompts"] = tu.nested_to_padded(data["prompts"], padding=self.tokenizer.pad_token_id)
+            data["responses"] = tu.nested_to_padded(data["responses"], padding=self.tokenizer.pad_token_id)
 
             uids = data.pop("uid").tolist()
             inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["prompts"]]
@@ -1567,8 +1567,8 @@ class PPOTrainer(ABC):
 
         prompt_lengths = data["prompts"].offsets().diff()
         response_lengths = data["responses"].offsets().diff()
-        prompts = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
-        responses = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+        prompts = tu.nested_to_padded(data["prompts"], padding=self.tokenizer.pad_token_id)
+        responses = tu.nested_to_padded(data["responses"], padding=self.tokenizer.pad_token_id)
 
         # 2. rebuild the attention mask aligned with the [prompts | responses] layout.
         prompt_mask = self._lengths_to_mask(prompt_lengths, prompts.size(1))

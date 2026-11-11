@@ -23,6 +23,30 @@ from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData, NonTensorStack
 
 
+def nested_to_padded(tensor: torch.Tensor, padding=0):
+    """Left-align a 2D jagged tensor into a dense ``[batch, max_len]`` buffer.
+
+    ``to_padded_tensor`` lowers to ``aten::_jagged_to_padded_dense_forward``, which
+    has no NPU kernel and runs on the CPU (performance warning on every process).
+    This preallocs the target and copies each sample's rows directly.
+    """
+    if not tensor.is_nested:
+        return tensor
+    if tensor.dim() != 2 or getattr(tensor, "_ragged_idx", 1) != 1:
+        return tensor.to_padded_tensor(padding)
+    offsets = tensor.offsets().tolist()
+    lengths = [end - start for start, end in zip(offsets[:-1], offsets[1:])]
+    max_len = max(lengths) if lengths else 0
+    padded = torch.full(
+        (tensor.shape[0], max_len), padding, dtype=tensor.dtype, device=tensor.device
+    )
+    values = tensor.values()
+    for i, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+        if end > start:
+            padded[i, : end - start].copy_(values[start:end])
+    return padded
+
+
 def assign_non_tensor_data(tensor_dict: TensorDict, key, val):
     """Assign a single non-tensor value to a TensorDict.
 
