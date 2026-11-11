@@ -23,6 +23,7 @@ Covers:
 - P1-5 exact dispatcher output count cache (no per-layer `.item()`)
 - P1-6 jagged -> dense padding without to_padded_tensor
 - P2-7 ragged route storage (short route tensors pad back to native rows)
+- P2-8 fully-async routed_experts passthrough via left_right_2_no_padding
 """
 
 from types import SimpleNamespace
@@ -550,3 +551,30 @@ def test_nested_to_padded_passes_dense_through():
 
     dense = torch.arange(6).reshape(2, 3)
     assert nested_to_padded(dense, padding=-1) is dense
+# --------------------------------------------------------------------------- #
+# P2-8: fully-async keeps routed_experts through padding conversion
+# --------------------------------------------------------------------------- #
+def test_left_right_2_no_padding_keeps_routed_experts_nested():
+    from tensordict import TensorDict
+
+    from verl.workers.utils.padding import left_right_2_no_padding
+
+    batch, seq = 2, 4
+    attention_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]])
+    td = TensorDict(
+        {
+            "input_ids": torch.zeros(batch, seq, dtype=torch.int64),
+            "attention_mask": attention_mask,
+            "response_mask": attention_mask.clone(),
+            "position_ids": torch.zeros(batch, seq, dtype=torch.int64),
+            "routed_experts": torch.arange(batch * seq * 2 * 2, dtype=torch.int32).reshape(batch, seq, 2, 2),
+        },
+        batch_size=batch,
+    )
+    out = left_right_2_no_padding(td)
+    routes = out["routed_experts"]
+    assert routes.is_nested
+    # valid rows per sample: 3 and 2
+    assert [part.shape[0] for part in routes.unbind()] == [3, 2]
+
+
