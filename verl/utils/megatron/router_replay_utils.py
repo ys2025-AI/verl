@@ -656,8 +656,16 @@ def _replay_num_out_tokens_per_layer(layers_topk_idx_reshape, replay_mask) -> li
     return [int(count) for count in counts.tolist()]
 
 
+def is_router_replay_debug_enabled() -> bool:
     """Whether ``VERL_ROUTER_REPLAY_DEBUG`` enables replay diagnostics."""
     return os.getenv("VERL_ROUTER_REPLAY_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_router_replay_rank_zero() -> bool:
+    """True on the only/global rank zero process, including non-distributed runs."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return True
+    return torch.distributed.get_rank() == 0
 
 
 def summarize_replay_mask(

@@ -504,20 +504,19 @@ def test_target_replay_mask_is_normalized_to_bool():
     assert torch.equal(replayed_indices[1], torch.topk(scores[1], k=2, dim=0).indices)
 
 
-# ====================================================
-
-
-# int16 replay cache (lazy cast)
+# ===========================================================
+# compact replay cache (uint8/int16 lazy cast)
 # ===========================================================
 
 
-def test_replay_index_dtype_uses_int16_when_experts_fit():
-    assert rr_utils._replay_index_dtype(SimpleNamespace(num_moe_experts=128)) == torch.int16
+def test_replay_index_dtype_uses_compact_storage():
+    assert rr_utils._replay_index_dtype(SimpleNamespace(num_moe_experts=128)) == torch.uint8
+    assert rr_utils._replay_index_dtype(SimpleNamespace(num_moe_experts=1000)) == torch.int16
     assert rr_utils._replay_index_dtype(SimpleNamespace(num_moe_experts=40000)) == torch.int64
     assert rr_utils._replay_index_dtype(SimpleNamespace()) == torch.int64
 
 
-def test_recording_stores_int16_indices():
+def test_recording_stores_compact_indices():
     router = RouterReplay()
     router.set_router_replay_action(RouterReplayAction.RECORD)
     scores = torch.randn(3, 8)
@@ -528,7 +527,7 @@ def test_recording_stores_int16_indices():
     _, native_indices = router.get_replay_topk(scores, 2, default_compute_topk=native_topk)
 
     assert native_indices.dtype == torch.int64
-    assert router.recorded_topk_idx.dtype == torch.int16
+    assert router.recorded_topk_idx.dtype == torch.uint8
 
 
 def test_replay_forward_lazily_casts_int16_targets_to_int64():
@@ -679,26 +678,6 @@ def test_target_replay_mask_is_normalized_to_bool():
 
 # int16 replay cache (lazy cast)
 # ===========================================================
-
-
-def test_replay_index_dtype_uses_int16_when_experts_fit():
-    assert rr_utils._replay_index_dtype(SimpleNamespace(num_moe_experts=128)) == torch.int16
-    assert rr_utils._replay_index_dtype(SimpleNamespace(num_moe_experts=40000)) == torch.int64
-    assert rr_utils._replay_index_dtype(SimpleNamespace()) == torch.int64
-
-
-def test_recording_stores_int16_indices():
-    router = RouterReplay()
-    router.set_router_replay_action(RouterReplayAction.RECORD)
-    scores = torch.randn(3, 8)
-
-    def native_topk(_scores, topk, **_kwargs):
-        return torch.topk(_scores, k=topk, dim=1)
-
-    _, native_indices = router.get_replay_topk(scores, 2, default_compute_topk=native_topk)
-
-    assert native_indices.dtype == torch.int64
-    assert router.recorded_topk_idx.dtype == torch.int16
 
 
 def test_replay_forward_lazily_casts_int16_targets_to_int64():
