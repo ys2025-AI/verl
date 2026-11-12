@@ -576,5 +576,3 @@ def test_left_right_2_no_padding_keeps_routed_experts_nested():
     assert routes.is_nested
     # valid rows per sample: 3 and 2
     assert [part.shape[0] for part in routes.unbind()] == [3, 2]
-
-
