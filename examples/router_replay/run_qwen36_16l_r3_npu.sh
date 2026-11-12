@@ -120,7 +120,7 @@ DATA=(
 MODEL=(
     actor_rollout_ref.model.path="$MODEL_PATH"
     actor_rollout_ref.model.trust_remote_code=True
-    actor_rollout_ref.model.use_remove_padding=False     # hybrid 线性注意力不支持 THD（13.2.1，硬约束）
+    actor_rollout_ref.model.use_remove_padding=False     # 默认 torch GDN 不支持 THD；Triton GDN 可改 True（runbook 13.2.1）
     actor_rollout_ref.model.use_fused_kernels=False
 )
 
